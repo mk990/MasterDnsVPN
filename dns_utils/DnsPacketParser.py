@@ -80,7 +80,7 @@ class DnsPacketParser:
             }
             return headers
         except Exception as e:
-            self.logger.error(f"Failed to parse DNS headers: {e}")
+            self.logger.debug(f"Failed to parse DNS headers: {e}")
             return {}
 
     async def parse_dns_question(
@@ -191,10 +191,16 @@ class DnsPacketParser:
         Parse the entire DNS packet from the data.
         Returns a dictionary with all sections.
         """
+        if len(data) < 12:
+            return {}
+
         try:
             headers = await self.parse_dns_headers(data)
             offset = 12
             questions, offset = await self.parse_dns_question(headers, data, offset)
+            if questions is None:
+                return {}
+
             answers, offset = await self._parse_resource_records_section(
                 headers, data, offset, "AnCount", "answer"
             )
@@ -213,7 +219,7 @@ class DnsPacketParser:
             }
             return dns_packet
         except Exception as e:
-            self.logger.error(f"Failed to parse DNS packet: {e}")
+            self.logger.debug(f"Failed to parse DNS packet: {e}")
             return {}
 
     async def server_fail_response(self, request_data: bytes) -> bytes:
