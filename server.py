@@ -540,9 +540,15 @@ class MasterDnsVPNServer:
                     await self._server_enqueue_tx(
                         session_id, 1, stream_id, sn, b"", is_ack=True
                     )
-                    self.loop.create_task(
-                        self._repeat_socks_syn_ack(session_id, stream_id)
-                    )
+
+                    now_ack = time.monotonic()
+                    last_syn_ack = stream_data.get("last_socks_syn_ack", 0.0)
+
+                    if now_ack - last_syn_ack >= 0.5:
+                        stream_data["last_socks_syn_ack"] = now_ack
+                        await self._server_enqueue_tx(
+                            session_id, 2, stream_id, 0, b"", is_socks_syn_ack=True
+                        )
 
                 elif stream_data["status"] == "SOCKS_CONNECTING":
                     await self._server_enqueue_tx(
@@ -941,6 +947,7 @@ class MasterDnsVPNServer:
             stream_data["arq_obj"] = arq
             stream_data["status"] = "CONNECTED"
 
+            stream_data["last_socks_syn_ack"] = time.monotonic()
             await self._server_enqueue_tx(
                 session_id, 2, stream_id, 0, b"", is_socks_syn_ack=True
             )
@@ -952,16 +959,6 @@ class MasterDnsVPNServer:
             await self.close_stream(
                 session_id, stream_id, reason=f"SOCKS target unreachable: {e}"
             )
-
-    async def _repeat_socks_syn_ack(self, session_id: int, stream_id: int):
-        for _ in range(3):
-            try:
-                await self._server_enqueue_tx(
-                    session_id, 2, stream_id, 0, b"", is_socks_syn_ack=True
-                )
-                await asyncio.sleep(0.08)
-            except Exception:
-                break
 
     async def handle_single_request(self, data, addr):
         """Handle a single DNS request efficiently."""
@@ -1432,9 +1429,9 @@ class MasterDnsVPNServer:
             "stream_id": stream_id,
             "created_at": now,
             "last_activity": now,
-            "status": "PENDING",
+            "status": "SOCKS_HANDSHAKE",
             "arq_obj": None,
-            "tx_queue": [],  # heapq
+            "tx_queue": [],
             "count_ack": 0,
             "count_fin": 0,
             "count_syn_ack": 0,
@@ -1445,7 +1442,8 @@ class MasterDnsVPNServer:
             "track_syn_ack": set(),
             "track_data": set(),
             "track_resend": set(),
-            "closed_streams": {},
+            "socks_chunks": {},
+            "last_socks_syn_ack": 0.0,
         }
 
         session_streams[stream_id] = stream_data
