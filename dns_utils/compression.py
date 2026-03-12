@@ -116,7 +116,15 @@ def try_decompress_payload(data: bytes, comp_type: int) -> tuple[bytes, bool]:
 
     try:
         if comp_type == Compression_Type.ZLIB:
-            return zlib.decompressobj(wbits=-15).decompress(data), True
+            dec = zlib.decompressobj(wbits=-15)
+            out = dec.decompress(data)
+            # Accept only complete, fully-consumed raw DEFLATE frames.
+            if not dec.eof or dec.unused_data:
+                return b"", False
+            tail = dec.flush()
+            if tail:
+                out += tail
+            return out, True
         if comp_type == Compression_Type.ZSTD:
             return _ZSTD_DECOMPRESSOR.decompress(data), True
         if comp_type == Compression_Type.LZ4:
