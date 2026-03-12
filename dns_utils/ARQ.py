@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from dns_utils.DNS_ENUMS import Packet_Type
+from dns_utils.DNS_ENUMS import Packet_Type, Stream_State
 
 
 @dataclass
@@ -80,66 +80,104 @@ class ARQ:
         control_rto: float = 0.8,
         control_max_rto: float = 2.5,
         control_max_retries: int = 15,
+        inactivity_timeout: float = 1200.0,
+        data_packet_ttl: float = 600.0,
+        max_data_retries: int = 400,
+        control_packet_ttl: float = 600.0,
+        fin_drain_timeout: float = 300.0,
+        graceful_drain_timeout: float = 600.0,
     ):
+        # -----------------------------------------------------------------
+        # Identity and I/O handles
+        # -----------------------------------------------------------------
         self.stream_id = stream_id
         self.session_id = session_id
         self.enqueue_tx = enqueue_tx_cb
+        self.enqueue_control_tx = enqueue_control_tx_cb
+        if not self.enqueue_control_tx:
+            raise ValueError(
+                "enqueue_control_tx_cb is required for ARQ control-plane packets"
+            )
         self.reader = reader
         self.writer = writer
-        self.mtu = mtu
+        self.mtu = int(mtu)
+        self.logger = logger or self._DummyLogger()
 
+        # -----------------------------------------------------------------
+        # Sequence and buffers
+        # -----------------------------------------------------------------
         self.snd_nxt = 0
         self.rcv_nxt = 0
-        self.snd_buf = {}
-        self.rcv_buf = {}
+        self.snd_buf: Dict[int, Dict[str, object]] = {}
+        self.rcv_buf: Dict[int, bytes] = {}
+        self.control_snd_buf: Dict[Tuple[int, int], _PendingControlPacket] = {}
 
-        self.last_activity = time.monotonic()
+        # -----------------------------------------------------------------
+        # Stream lifecycle and TCP-like control flags
+        # -----------------------------------------------------------------
+        self.state = Stream_State.OPEN
         self.closed = False
         self.close_reason = "Unknown"
-        self.logger = logger or self._DummyLogger()
+        self.last_activity = time.monotonic()
 
         self._fin_sent = False
         self._fin_received = False
         self._fin_acked = False
-        self._fin_seq_sent = None
-        self._fin_seq_received = None
+        self._fin_seq_sent: Optional[int] = None
+        self._fin_seq_received: Optional[int] = None
 
         self._rst_received = False
         self._rst_sent = False
         self._rst_acked = False
-        self._rst_seq_sent = None
-        self._rst_seq_received = None
-        self._close_time = None
+        self._rst_seq_sent: Optional[int] = None
+        self._rst_seq_received: Optional[int] = None
 
         self._local_write_closed = False
         self._remote_write_closed = False
+        # FIN-from-remote means stop local reader, but DO NOT drop queues.
+        self._stop_local_read = False
 
-        self.rto = rto
-        self.max_rto = max_rto
-
-        self.window_size = window_size
+        # -----------------------------------------------------------------
+        # Data-plane ARQ profile (aggressive but capped by user max)
+        # -----------------------------------------------------------------
+        self.window_size = max(1, int(window_size))
         self.limit = max(50, int(self.window_size * 0.8))
         self.window_not_full = asyncio.Event()
         self.window_not_full.set()
         self._write_lock = asyncio.Lock()
-        self.state = "OPEN"  # OPEN, HALF_CLOSED_LOCAL, HALF_CLOSED_REMOTE, CLOSING, TIME_WAIT, RESET, CLOSED
 
-        self.is_socks = is_socks
+        user_max_rto = max(0.05, float(max_rto))
+        self.max_rto = user_max_rto
+        self.rto = min(max(0.05, float(rto)), self.max_rto)
+
+        self.inactivity_timeout = max(120.0, float(inactivity_timeout))
+        self.data_packet_ttl = max(120.0, float(data_packet_ttl))
+        self.max_data_retries = max(20, int(max_data_retries))
+        self.fin_drain_timeout = max(30.0, float(fin_drain_timeout))
+        self.graceful_drain_timeout = max(60.0, float(graceful_drain_timeout))
+
+        # -----------------------------------------------------------------
+        # Optional SOCKS pre-connection payload handling
+        # -----------------------------------------------------------------
+        self.is_socks = bool(is_socks)
         self.initial_data = initial_data
         self.socks_connected = asyncio.Event()
         if not self.is_socks:
             self.socks_connected.set()
 
-        # Control-plane reliability (optional): keeps ARQ data-path intact
-        # while allowing control packets to be retried/acked with sequence numbers.
-        self.enqueue_control_tx = enqueue_control_tx_cb
+        # -----------------------------------------------------------------
+        # Control-plane ARQ profile (for SYN/FIN/RST/SOCKS control packets)
+        # -----------------------------------------------------------------
         self.enable_control_reliability = bool(enable_control_reliability)
-        self.control_rto = float(control_rto)
-        self.control_max_rto = float(control_max_rto)
-        self.control_max_retries = int(control_max_retries)
-        self.control_snd_buf: Dict[Tuple[int, int], _PendingControlPacket] = {}
+        user_control_max_rto = max(0.05, float(control_max_rto))
+        self.control_max_rto = user_control_max_rto
+        self.control_rto = min(max(0.05, float(control_rto)), self.control_max_rto)
+        self.control_max_retries = max(5, int(control_max_retries))
+        self.control_packet_ttl = max(120.0, float(control_packet_ttl))
+
         self._control_ack_map = dict(self.CONTROL_ACK_PAIRS)
         self._control_reverse_ack_map = {v: k for k, v in self._control_ack_map.items()}
+
         try:
             sock = writer.get_extra_info("socket")
             if sock and sock.fileno() != -1:
@@ -160,6 +198,109 @@ class ARQ:
             self.io_task = None
             self.rtx_task = None
 
+    # Set stream lifecycle state (uses Stream_State enum).
+    def _set_state(self, new_state: str) -> None:
+        self.state = new_state
+
+    # Normalize sequence number to uint16 (0..65535).
+    def _norm_sn(self, sn: int) -> int:
+        return int(sn) & 0xFFFF
+
+    # Check whether stream is in reset path.
+    def is_reset(self) -> bool:
+        return self.state == Stream_State.RESET or self._rst_received or self._rst_sent
+
+    # Return True when local app side can continue reading.
+    def is_open_for_local_read(self) -> bool:
+        return (
+            (not self.closed)
+            and (not self._stop_local_read)
+            and (not self._local_write_closed)
+        )
+
+    # Stop local reader after peer FIN; keep queues for draining.
+    def set_local_reader_closed(self, reason: str = "") -> None:
+        self._stop_local_read = True
+        if reason:
+            self.close_reason = reason
+        if self.state == Stream_State.OPEN:
+            self._set_state(Stream_State.HALF_CLOSED_REMOTE)
+
+    # Mark local writer as closed (half-close local).
+    def set_local_writer_closed(self) -> None:
+        self._local_write_closed = True
+        if self.state == Stream_State.OPEN:
+            self._set_state(Stream_State.HALF_CLOSED_LOCAL)
+
+    # Clear all buffers immediately (RST/abort semantics).
+    def _clear_all_queues(self) -> None:
+        self.snd_buf.clear()
+        self.rcv_buf.clear()
+        self.control_snd_buf.clear()
+        self.window_not_full.set()
+
+    # ---------------------------------------------------------------------
+    # External transition hooks for client/server integration
+    # ---------------------------------------------------------------------
+    # Register outbound FIN and transition state.
+    def mark_fin_sent(self, seq_num: Optional[int] = None) -> None:
+        self._fin_sent = True
+        if seq_num is not None:
+            self._fin_seq_sent = self._norm_sn(seq_num)
+        elif self._fin_seq_sent is None:
+            self._fin_seq_sent = self._norm_sn(self.snd_nxt)
+
+        if self._fin_received:
+            self._set_state(Stream_State.CLOSING)
+        else:
+            self._set_state(Stream_State.HALF_CLOSED_LOCAL)
+
+    # Register inbound FIN and stop local read side.
+    def mark_fin_received(self, seq_num: int) -> None:
+        self._fin_received = True
+        self._fin_seq_received = self._norm_sn(seq_num)
+        self._stop_local_read = True
+
+        if self._fin_sent:
+            self._set_state(Stream_State.CLOSING)
+        else:
+            self._set_state(Stream_State.HALF_CLOSED_REMOTE)
+
+    # Register ACK for our FIN.
+    def mark_fin_acked(self, seq_num: int) -> None:
+        sn = self._norm_sn(seq_num)
+        if self._fin_seq_sent is not None and sn == self._fin_seq_sent:
+            self._fin_acked = True
+        if self._fin_received:
+            self._set_state(Stream_State.CLOSING)
+
+    # Register outbound RST and move to RESET state.
+    def mark_rst_sent(self, seq_num: Optional[int] = None) -> None:
+        self._rst_sent = True
+        if seq_num is not None:
+            self._rst_seq_sent = self._norm_sn(seq_num)
+        elif self._rst_seq_sent is None:
+            self._rst_seq_sent = self._norm_sn(self.snd_nxt)
+        self._set_state(Stream_State.RESET)
+
+    # Register inbound RST and drop all buffers.
+    def mark_rst_received(self, seq_num: int) -> None:
+        self._rst_received = True
+        self._rst_seq_received = self._norm_sn(seq_num)
+        self._set_state(Stream_State.RESET)
+        self._clear_all_queues()
+
+    # Register ACK for our RST.
+    def mark_rst_acked(self, seq_num: int) -> None:
+        sn = self._norm_sn(seq_num)
+        if self._rst_seq_sent is not None and sn == self._rst_seq_sent:
+            self._rst_acked = True
+        self._set_state(Stream_State.RESET)
+
+    # ---------------------------------------------------------------------
+    # Core loops
+    # ---------------------------------------------------------------------
+    # Read local socket data and enqueue reliable outbound packets.
     async def _io_loop(self):
         _read = self.reader.read
         _enqueue = self.enqueue_tx
@@ -175,7 +316,7 @@ class ARQ:
             if self.is_socks and self.initial_data:
                 offset = 0
                 total_len = len(self.initial_data)
-                while offset < total_len:
+                while offset < total_len and not self.closed:
                     chunk = self.initial_data[offset : offset + _mtu]
                     sn = self.snd_nxt
                     self.snd_nxt = (sn + 1) % 65536
@@ -186,9 +327,8 @@ class ARQ:
                         "create_time": _monotonic(),
                         "retries": 0,
                         "current_rto": self.rto,
-                        "is_socks_syn": True,
                     }
-                    await _enqueue(3, self.stream_id, sn, chunk, is_socks_syn=True)
+                    await _enqueue(3, self.stream_id, sn, chunk)
                     offset += _mtu
 
             await self.socks_connected.wait()
@@ -196,8 +336,13 @@ class ARQ:
             while not self.closed:
                 await self.window_not_full.wait()
 
-                if self._fin_received:
-                    self.close_reason = "FIN Received, No More Data to Send"
+                if self._fin_received and not self._stop_local_read:
+                    self.set_local_reader_closed(
+                        "Remote FIN received; local reader stopped"
+                    )
+
+                if self._stop_local_read:
+                    self.close_reason = "Remote FIN received; local reader stopped"
                     break
 
                 try:
@@ -226,7 +371,6 @@ class ARQ:
                     "create_time": _monotonic(),
                     "retries": 0,
                     "current_rto": self.rto,
-                    "is_socks_syn": False,
                 }
 
                 if len(self.snd_buf) >= _limit:
@@ -247,7 +391,8 @@ class ARQ:
                 return
 
             if self._fin_received:
-                wait_deadline = time.monotonic() + 180.0
+                # Do not drop outbound queue. Drain and then graceful close.
+                wait_deadline = time.monotonic() + self.fin_drain_timeout
                 while (
                     self.snd_buf
                     and time.monotonic() < wait_deadline
@@ -257,7 +402,7 @@ class ARQ:
 
                 if self.snd_buf and not self.closed:
                     await self.abort(
-                        reason="Remote FIN but local send buffer did not drain"
+                        reason="Remote FIN received but local send buffer did not drain"
                     )
                     return
 
@@ -270,13 +415,16 @@ class ARQ:
             if graceful_eof:
                 await self._initiate_graceful_close(reason=error_reason or "Local EOF")
 
+    # Drain outstanding sends and then close with FIN.
     async def _initiate_graceful_close(self, reason="Graceful close"):
         if self.closed:
             return
 
         self.close_reason = reason
+        if self.state not in (Stream_State.RESET, Stream_State.CLOSED):
+            self._set_state(Stream_State.DRAINING)
 
-        deadline = time.monotonic() + 300.0
+        deadline = time.monotonic() + self.graceful_drain_timeout
         while self.snd_buf and time.monotonic() < deadline and not self.closed:
             await asyncio.sleep(0.05)
 
@@ -289,6 +437,7 @@ class ARQ:
 
         await self.close(reason=reason, send_fin=True)
 
+    # Complete remote FIN handling when receive sequence catches up.
     async def _try_finalize_remote_eof(self):
         if (
             self.closed
@@ -316,43 +465,56 @@ class ARQ:
             pass
 
         try:
-            await self.enqueue_tx(
-                0,
-                self.stream_id,
-                self._fin_seq_received,
-                b"",
-                is_fin_ack=True,
+            await self.send_control_packet(
+                packet_type=Packet_Type.STREAM_FIN_ACK,
+                sequence_num=self._fin_seq_received,
+                payload=b"",
+                priority=0,
+                track_for_ack=False,
             )
         except Exception:
             pass
 
         if self._fin_sent and self._fin_acked and not self.snd_buf:
-            await self.close(reason="Both FINs fully acknowledged")
+            await self.close(reason="Both FIN sides fully acknowledged")
 
+    # Periodic scheduler that triggers data/control retransmission checks.
     async def _retransmit_loop(self):
-        """Separate lightweight task for RTO checks."""
         _sleep = asyncio.sleep
         try:
             while not self.closed:
-                await _sleep(self.rto / 2.0)
+                interval = max(
+                    0.05,
+                    min(
+                        self.rto,
+                        self.control_rto
+                        if self.enable_control_reliability
+                        else self.rto,
+                    )
+                    / 3.0,
+                )
+                await _sleep(interval)
                 if self.closed:
                     break
-
                 try:
                     await self.check_retransmits()
                 except Exception as e:
                     self.logger.debug(
                         f"Retransmit check error on stream {self.stream_id}: {e}"
                     )
-
         except asyncio.CancelledError:
             pass
 
+    # ---------------------------------------------------------------------
+    # Data plane
+    # ---------------------------------------------------------------------
+    # Handle inbound STREAM_DATA and emit STREAM_DATA_ACK.
     async def receive_data(self, sn, data):
-        if self.closed:
+        if self.closed or self.is_reset():
             return
 
         self.last_activity = time.monotonic()
+        sn = self._norm_sn(sn)
 
         diff = (sn - self.rcv_nxt) % 65536
         if diff >= 32768:
@@ -368,7 +530,6 @@ class ARQ:
         has_written = False
         _write = self.writer.write
         _pop = self.rcv_buf.pop
-
         data_to_write = []
 
         while self.rcv_nxt in self.rcv_buf:
@@ -390,28 +551,25 @@ class ARQ:
                 return
 
         await self.enqueue_tx(0, self.stream_id, sn, b"", is_ack=True)
-
         await self._try_finalize_remote_eof()
 
+    # Handle inbound STREAM_DATA_ACK and free send-window entries.
     async def receive_ack(self, sn):
         self.last_activity = time.monotonic()
+        sn = self._norm_sn(sn)
 
         if self.snd_buf.pop(sn, None) is not None:
             if len(self.snd_buf) < self.limit:
                 self.window_not_full.set()
 
+    # Handle inbound STREAM_RST_ACK and resolve reset tracking.
     async def receive_rst_ack(self, sn):
-        self.last_activity = time.monotonic()
+        await self.receive_control_ack(Packet_Type.STREAM_RST_ACK, sn)
 
-        if self._rst_seq_sent is not None and sn == self._rst_seq_sent:
-            self._rst_acked = True
-
-        if self.enable_control_reliability:
-            self._mark_control_acked(Packet_Type.STREAM_RST_ACK, sn)
-
-    def _norm_sn(self, sn: int) -> int:
-        return int(sn) & 0xFFFF
-
+    # ---------------------------------------------------------------------
+    # Control plane reliability helpers
+    # ---------------------------------------------------------------------
+    # Send control frame through dedicated control callback.
     async def _send_control_frame(
         self,
         packet_type: int,
@@ -424,43 +582,23 @@ class ARQ:
         sn = self._norm_sn(sequence_num)
         data = payload or b""
 
-        # Preferred path: direct control callback with explicit packet_type.
-        if self.enqueue_control_tx:
-            await self.enqueue_control_tx(
-                int(priority),
-                self.stream_id,
-                sn,
-                ptype,
-                data,
-                is_retransmit=is_retransmit,
+        if not self.enqueue_control_tx:
+            self.logger.error(
+                f"Stream {self.stream_id}: enqueue_control_tx callback is required for control packets"
             )
-            return True
+            return False
 
-        # Backward-compatible fallback using existing enqueue_tx flag API.
-        if ptype == Packet_Type.STREAM_FIN:
-            await self.enqueue_tx(int(priority), self.stream_id, sn, data, is_fin=True)
-            return True
-        if ptype == Packet_Type.STREAM_FIN_ACK:
-            await self.enqueue_tx(0, self.stream_id, sn, data, is_fin_ack=True)
-            return True
-        if ptype == Packet_Type.STREAM_RST:
-            await self.enqueue_tx(0, self.stream_id, sn, data, is_rst=True)
-            return True
-        if ptype == Packet_Type.STREAM_RST_ACK:
-            await self.enqueue_tx(0, self.stream_id, sn, data, is_rst_ack=True)
-            return True
-        if ptype == Packet_Type.STREAM_DATA_ACK:
-            await self.enqueue_tx(0, self.stream_id, sn, data, is_ack=True)
-            return True
-        if ptype == Packet_Type.SOCKS5_SYN:
-            await self.enqueue_tx(
-                int(priority), self.stream_id, sn, data, is_socks_syn=True
-            )
-            return True
+        await self.enqueue_control_tx(
+            int(priority),
+            self.stream_id,
+            sn,
+            ptype,
+            data,
+            is_retransmit=is_retransmit,
+        )
+        return True
 
-        # STREAM_SYN / STREAM_SYN_ACK and some control types need explicit control callback.
-        return False
-
+    # Track control packet until expected ACK arrives.
     def _track_control_packet(
         self,
         packet_type: int,
@@ -486,6 +624,7 @@ class ARQ:
             create_time=now,
         )
 
+    # Send control packet and optionally enable ACK tracking.
     async def send_control_packet(
         self,
         packet_type: int,
@@ -526,6 +665,7 @@ class ARQ:
         )
         return True
 
+    # Mark tracked control packet as ACKed by ack_type + sequence.
     def _mark_control_acked(self, ack_packet_type: int, sequence_num: int) -> bool:
         ack_ptype = int(ack_packet_type)
         sn = self._norm_sn(sequence_num)
@@ -537,12 +677,9 @@ class ARQ:
         if self.control_snd_buf.pop((origin_ptype, sn), None) is not None:
             return True
 
-        # Compatibility fallback for peers that may ACK non-seq control with sn=0.
-        if self.control_snd_buf.pop((origin_ptype, 0), None) is not None:
-            return True
-
         return False
 
+    # Process inbound control ACK and update FIN/RST state hooks.
     async def receive_control_ack(
         self, ack_packet_type: int, sequence_num: int
     ) -> bool:
@@ -552,21 +689,20 @@ class ARQ:
         sn = self._norm_sn(sequence_num)
 
         if ack_ptype == Packet_Type.STREAM_FIN_ACK:
-            if self._fin_seq_sent is not None and sn == self._fin_seq_sent:
-                self._fin_acked = True
+            self.mark_fin_acked(sn)
         elif ack_ptype == Packet_Type.STREAM_RST_ACK:
-            if self._rst_seq_sent is not None and sn == self._rst_seq_sent:
-                self._rst_acked = True
+            self.mark_rst_acked(sn)
 
         return self._mark_control_acked(ack_ptype, sn)
 
+    # Retransmit pending control packets with aggressive capped RTO.
     async def _check_control_retransmits(self, now: float) -> None:
         if not self.control_snd_buf:
             return
 
         for key, info in list(self.control_snd_buf.items()):
             if (
-                info.create_time + 120.0 <= now
+                info.create_time + self.control_packet_ttl <= now
                 and info.retries >= self.control_max_retries
             ):
                 self.control_snd_buf.pop(key, None)
@@ -584,127 +720,127 @@ class ARQ:
             )
 
             if not sent:
-                # Cannot resend this control type on legacy callback path.
                 self.control_snd_buf.pop(key, None)
                 continue
 
             info.time = now
             info.retries += 1
-            info.current_rto = min(self.control_max_rto, info.current_rto * 1.5)
+            # Aggressive backoff but always capped by user max.
+            info.current_rto = min(
+                self.control_max_rto, max(self.control_rto, info.current_rto * 1.2)
+            )
 
+    # ---------------------------------------------------------------------
+    # Retransmit / shutdown
+    # ---------------------------------------------------------------------
+    # Retransmit pending data/control packets and enforce lifetimes.
     async def check_retransmits(self):
         if self.closed:
             return
 
-        now = time.monotonic()
-
-        if now - self.last_activity > 300.0:
-            await self.abort(reason="Stream Inactivity Timeout (Dead)")
+        if self._rst_received and self.state != Stream_State.RESET:
+            self.mark_rst_received(self._rst_seq_received or 0)
+            await self.abort(reason="Peer reset signaled", send_rst=False)
             return
 
+        now = time.monotonic()
+
+        # In high-loss / slow-resolver paths, do not kill active retransmit queues.
+        if now - self.last_activity > self.inactivity_timeout:
+            if self.snd_buf or (
+                self.enable_control_reliability and self.control_snd_buf
+            ):
+                self.last_activity = now
+            else:
+                await self.abort(reason="Stream Inactivity Timeout (Dead)")
+                return
+
         items_to_resend = []
-        _append = items_to_resend.append
 
         for sn, info in list(self.snd_buf.items()):
-            if info["create_time"] + 120.0 <= now and info["retries"] >= 100:
+            if (
+                info["create_time"] + self.data_packet_ttl <= now
+                and info["retries"] >= self.max_data_retries
+            ):
                 await self.abort(reason=f"Max retransmissions exceeded for sn={sn}")
                 return
 
             if now - info["time"] >= info["current_rto"]:
-                items_to_resend.append(
-                    (sn, info["data"], info.get("is_socks_syn", False))
-                )
+                items_to_resend.append((sn, info["data"]))
                 info["time"] = now
                 info["retries"] += 1
-                dynamic_max = max(
-                    self.max_rto, 15.0 if info["retries"] > 10 else self.max_rto
+                # Aggressive and capped by max_rto from user config.
+                info["current_rto"] = min(
+                    self.max_rto, max(self.rto, info["current_rto"] * 1.2)
                 )
-                info["current_rto"] = min(dynamic_max, info["current_rto"] * 1.5)
 
         _enqueue = self.enqueue_tx
         _sid = self.stream_id
 
-        for sn, data, is_socks_syn in items_to_resend:
-            if is_socks_syn:
-                await _enqueue(1, _sid, sn, data, is_socks_syn=True)
-            else:
-                await _enqueue(1, _sid, sn, data, is_resend=True)
+        for sn, data in items_to_resend:
+            await _enqueue(1, _sid, sn, data, is_resend=True)
 
         if self.enable_control_reliability:
             await self._check_control_retransmits(now)
 
+    # Abort stream immediately (RST behavior) and clear queues.
     async def abort(self, reason="Abort", send_rst=True):
         if self.closed:
             return
 
+        self.close_reason = reason
+        self._set_state(Stream_State.RESET)
         if send_rst and not self._rst_sent and not self._rst_received:
-            self._rst_sent = True
-            if self._rst_seq_sent is None:
-                self._rst_seq_sent = self.snd_nxt
-
+            self.mark_rst_sent(self.snd_nxt)
             try:
-                if self.enable_control_reliability:
-                    await self.send_control_packet(
-                        packet_type=Packet_Type.STREAM_RST,
-                        sequence_num=self._rst_seq_sent,
-                        payload=b"",
-                        priority=0,
-                        track_for_ack=True,
-                        ack_type=Packet_Type.STREAM_RST_ACK,
-                    )
-                else:
-                    await self.enqueue_tx(
-                        0,
-                        self.stream_id,
-                        self._rst_seq_sent,
-                        b"",
-                        is_rst=True,
-                    )
+                await self.send_control_packet(
+                    packet_type=Packet_Type.STREAM_RST,
+                    sequence_num=self._rst_seq_sent,
+                    payload=b"",
+                    priority=0,
+                    track_for_ack=self.enable_control_reliability,
+                    ack_type=Packet_Type.STREAM_RST_ACK,
+                )
             except Exception:
                 pass
-
+        # TCP RST behavior: drop all queued data immediately.
+        self._clear_all_queues()
         await self.close(reason=reason, send_fin=False)
 
+    # Close stream gracefully (or directly) and finalize resources.
     async def close(self, reason="Unknown", send_fin=True):
         if self.closed:
             return
 
-        self.closed = True
         self.close_reason = reason
-        self._close_time = time.monotonic()
-
         if (
             send_fin
             and not self._fin_sent
             and not self._rst_sent
             and not self._rst_received
         ):
-            self._fin_sent = True
-            if self._fin_seq_sent is None:
-                self._fin_seq_sent = self.snd_nxt
+            self.mark_fin_sent(self.snd_nxt)
             try:
-                if self.enable_control_reliability:
-                    await self.send_control_packet(
-                        packet_type=Packet_Type.STREAM_FIN,
-                        sequence_num=self._fin_seq_sent,
-                        payload=b"",
-                        priority=4,
-                        track_for_ack=True,
-                        ack_type=Packet_Type.STREAM_FIN_ACK,
-                    )
-                else:
-                    await self.enqueue_tx(
-                        4,
-                        self.stream_id,
-                        self._fin_seq_sent,
-                        b"",
-                        is_fin=True,
-                    )
+                await self.send_control_packet(
+                    packet_type=Packet_Type.STREAM_FIN,
+                    sequence_num=self._fin_seq_sent,
+                    payload=b"",
+                    priority=4,
+                    track_for_ack=self.enable_control_reliability,
+                    ack_type=Packet_Type.STREAM_FIN_ACK,
+                )
             except Exception:
                 pass
+        if self.is_reset():
+            self._set_state(Stream_State.RESET)
+        elif self._fin_sent and self._fin_received:
+            self._set_state(Stream_State.TIME_WAIT)
+        else:
+            self._set_state(Stream_State.CLOSING)
+
+        self.closed = True
 
         current_task = asyncio.current_task()
-
         for task in (getattr(self, "io_task", None), getattr(self, "rtx_task", None)):
             if task and not task.done() and task is not current_task:
                 task.cancel()
@@ -726,3 +862,5 @@ class ARQ:
                     pass
         except Exception:
             pass
+
+        self._set_state(Stream_State.CLOSED)

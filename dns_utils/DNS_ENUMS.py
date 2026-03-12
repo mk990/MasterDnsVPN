@@ -1,4 +1,4 @@
-﻿# MasterDnsVPN
+# MasterDnsVPN
 # Author: MasterkinG32
 # Github: https://github.com/masterking32
 # Year: 2026
@@ -78,6 +78,18 @@ class Packet_Type:
 
     # System/control
     ERROR_DROP = 0xFF  # Invalid/Drop signal
+
+
+class Stream_State:
+    # Active stream states (TCP-like lifecycle)
+    OPEN = 1  # Stream is fully open for read/write
+    HALF_CLOSED_LOCAL = 2  # Local write side is closed
+    HALF_CLOSED_REMOTE = 3  # Remote write side is closed
+    DRAINING = 4  # Waiting for outbound queues to drain before FIN
+    CLOSING = 5  # Closing handshake is in progress
+    TIME_WAIT = 6  # FIN handshake completed, waiting final cleanup
+    RESET = 7  # Stream aborted by RST
+    CLOSED = 8  # Stream is fully closed
 
 
 # DNS Resource Record Types (qType)
