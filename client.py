@@ -38,9 +38,17 @@ class MasterDnsVPNClient(PacketQueueMixin):
     """MasterDnsVPN Client class to handle DNS requests over UDP."""
 
     def __init__(self) -> None:
+        # ---------------------------------------------------------
+        # Runtime and lifecycle primitives
+        # ---------------------------------------------------------
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.should_stop: asyncio.Event = asyncio.Event()
         self.session_restart_event = None
+        self.rx_tasks = set()
+
+        # ---------------------------------------------------------
+        # Config and logger bootstrap
+        # ---------------------------------------------------------
         self.config: dict = load_config("client_config.toml")
         if not os.path.isfile(get_config_path("client_config.toml")):
             self.logger = getLogger(log_level=self.config.get("LOG_LEVEL", "DEBUG"))
@@ -54,25 +62,17 @@ class MasterDnsVPNClient(PacketQueueMixin):
             sys.exit(1)
 
         self.logger = getLogger(log_level=self.config.get("LOG_LEVEL", "INFO"))
-        self.resolvers: list = self.config.get("RESOLVER_DNS_SERVERS", [])
-        self.domains: list = self.config.get("DOMAINS", [])
-        self.timeout: float = self.config.get("DNS_QUERY_TIMEOUT", 5.0)
-        self.max_upload_mtu: int = self.config.get("MAX_UPLOAD_MTU", 512)
-        self.max_download_mtu: int = self.config.get("MAX_DOWNLOAD_MTU", 1200)
-        self.min_upload_mtu: int = self.config.get("MIN_UPLOAD_MTU", 0)
-        self.min_download_mtu: int = self.config.get("MIN_DOWNLOAD_MTU", 0)
 
-        self.base_encode_responses: bool = self.config.get("BASE_ENCODE_DATA", False)
-
-        self.mtu_test_retries: int = self.config.get("MTU_TEST_RETRIES", 2)
-        self.mtu_test_timeout: float = float(self.config.get("MTU_TEST_TIMEOUT", 1.0))
-
-        self.encryption_method: int = self.config.get("DATA_ENCRYPTION_METHOD", 1)
-
+        # ---------------------------------------------------------
+        # Protocol and authentication configuration
+        # ---------------------------------------------------------
         self.protocol_type: str = self.config.get("PROTOCOL_TYPE", "SOCKS5").upper()
         self.socks5_auth: bool = self.config.get("SOCKS5_AUTH", False)
         self.socks5_user: str = str(self.config.get("SOCKS5_USER", ""))
         self.socks5_pass: str = str(self.config.get("SOCKS5_PASS", ""))
+        self.socks_handshake_timeout: float = float(
+            self.config.get("SOCKS_HANDSHAKE_TIMEOUT", 240.0)
+        )
 
         if self.protocol_type not in ("SOCKS5", "TCP"):
             self.logger.error(
@@ -81,19 +81,46 @@ class MasterDnsVPNClient(PacketQueueMixin):
             input("Press Enter to exit...")
             sys.exit(1)
 
-        self.crypto_overhead = 0
-        if self.encryption_method == 2:
-            self.crypto_overhead = 16
-        elif self.encryption_method in (3, 4, 5):
-            self.crypto_overhead = 28
-
-        self.success_mtu_checks: bool = False
-        self.max_packed_blocks: int = 1
-        self.max_packets_per_batch: int = self.config.get("MAX_PACKETS_PER_BATCH", 3)
-
-        self.resolver_balancing_strategy: int = self.config.get(
-            "RESOLVER_BALANCING_STRATEGY", 0
+        # ---------------------------------------------------------
+        # DNS transport and listener configuration
+        # ---------------------------------------------------------
+        self.resolvers: list = self.config.get("RESOLVER_DNS_SERVERS", [])
+        self.domains: list = self.config.get("DOMAINS", [])
+        self.domains_lower: tuple = tuple(
+            sorted((d.lower() for d in self.domains), key=len, reverse=True)
         )
+        self.timeout: float = self.config.get("DNS_QUERY_TIMEOUT", 5.0)
+        self.listener_ip = self.config.get("LISTEN_IP", "127.0.0.1")
+        self.listener_port = int(self.config.get("LISTEN_PORT", 1080))
+        self.buffer_size = 65507  # Max UDP payload size
+
+        # ---------------------------------------------------------
+        # MTU, batching and queueing configuration
+        # ---------------------------------------------------------
+        self.max_upload_mtu: int = self.config.get("MAX_UPLOAD_MTU", 512)
+        self.max_download_mtu: int = self.config.get("MAX_DOWNLOAD_MTU", 1200)
+        self.min_upload_mtu: int = self.config.get("MIN_UPLOAD_MTU", 0)
+        self.min_download_mtu: int = self.config.get("MIN_DOWNLOAD_MTU", 0)
+        self.mtu_test_retries: int = self.config.get("MTU_TEST_RETRIES", 2)
+        self.mtu_test_timeout: float = float(self.config.get("MTU_TEST_TIMEOUT", 1.0))
+        self.max_packets_per_batch: int = int(
+            self.config.get("MAX_PACKETS_PER_BATCH", 3)
+        )
+        self.packet_duplication_count = self.config.get("PACKET_DUPLICATION_COUNT", 1)
+
+        # ---------------------------------------------------------
+        # ARQ and flow-control configuration
+        # ---------------------------------------------------------
+        self.arq_window_size = self.config.get("ARQ_WINDOW_SIZE", 3000)
+        self.arq_initial_rto = self.config.get("ARQ_INITIAL_RTO", 0.2)
+        self.arq_max_rto = self.config.get("ARQ_MAX_RTO", 1.5)
+        self.rx_semaphore = asyncio.Semaphore(200)
+
+        # ---------------------------------------------------------
+        # Crypto and payload encoding configuration
+        # ---------------------------------------------------------
+        self.base_encode_responses: bool = self.config.get("BASE_ENCODE_DATA", False)
+        self.encryption_method: int = self.config.get("DATA_ENCRYPTION_METHOD", 1)
         self.encryption_key: str = self.config.get("ENCRYPTION_KEY", None)
 
         if not self.encryption_key:
@@ -104,45 +131,51 @@ class MasterDnsVPNClient(PacketQueueMixin):
             input("Press Enter to exit...")
             sys.exit(1)
 
-        self.dns_parser = DnsPacketParser(
-            logger=self.logger,
-            encryption_method=self.encryption_method,
-            encryption_key=self.encryption_key,
-        )
+        self.crypto_overhead = 0
+        if self.encryption_method == 2:
+            self.crypto_overhead = 16
+        elif self.encryption_method in (3, 4, 5):
+            self.crypto_overhead = 28
 
+        # ---------------------------------------------------------
+        # Runtime state and counters
+        # ---------------------------------------------------------
+        self.success_mtu_checks: bool = False
+        self.max_packed_blocks: int = 1
         self.connections_map: list = []
         self.session_id = 0
         self.synced_upload_mtu = 0
         self.synced_upload_mtu_chars = 0
         self.synced_download_mtu = 0
-        self.buffer_size = 65507  # Max UDP payload size
-        self.balancer = DNSBalancer(
-            resolvers=self.connections_map, strategy=self.resolver_balancing_strategy
-        )
-        self.server_rtt_tracker = {}
-        self.ping_manager = PingManager(self._send_ping_packet)
-        self.packet_duplication_count = self.config.get("PACKET_DUPLICATION_COUNT", 1)
-        self.rx_tasks = set()
-        self.domains: list = self.config.get("DOMAINS", [])
-        self.domains_lower: tuple = tuple(
-            sorted((d.lower() for d in self.domains), key=len, reverse=True)
-        )
+
         self.main_queue = []
         self.priority_counts = {}
         self.tx_event = asyncio.Event()
-        self.rx_semaphore = asyncio.Semaphore(200)
-        self.listener_ip = self.config.get("LISTEN_IP", "127.0.0.1")
-        self.listener_port = int(self.config.get("LISTEN_PORT", 1080))
+        self.enqueue_seq = 0
+        self.count_ping = 0
 
-        self.arq_window_size = self.config.get("ARQ_WINDOW_SIZE", 3000)
-        self.arq_initial_rto = self.config.get("ARQ_INITIAL_RTO", 0.2)
-        self.arq_max_rto = self.config.get("ARQ_MAX_RTO", 1.5)
-        self.socks_handshake_timeout = float(
-            self.config.get("SOCKS_HANDSHAKE_TIMEOUT", 240.0)
+        self.server_rtt_tracker = {}
+
+        # ---------------------------------------------------------
+        # Resolver balancing and protocol helpers
+        # ---------------------------------------------------------
+        self.resolver_balancing_strategy: int = self.config.get(
+            "RESOLVER_BALANCING_STRATEGY", 0
+        )
+        self.balancer = DNSBalancer(
+            resolvers=self.connections_map, strategy=self.resolver_balancing_strategy
         )
 
-        self.logger.debug("<magenta>[INIT]</magenta> MasterDnsVPNClient initialized.")
+        self.dns_parser = DnsPacketParser(
+            logger=self.logger,
+            encryption_method=self.encryption_method,
+            encryption_key=self.encryption_key,
+        )
+        self.ping_manager = PingManager(self._send_ping_packet)
 
+        # ---------------------------------------------------------
+        # Packet/control metadata tables
+        # ---------------------------------------------------------
         self._block_packer = struct.Struct(">BHH")
         self._valid_packet_types = {
             v
@@ -193,8 +226,14 @@ class MasterDnsVPNClient(PacketQueueMixin):
             Packet_Type.SOCKS5_AUTH_FAILED: 0x01,
             Packet_Type.SOCKS5_UPSTREAM_UNAVAILABLE: 0x01,
         }
+
+        # ---------------------------------------------------------
+        # Config version markers
+        # ---------------------------------------------------------
         self.config_version = self.config.get("CONFIG_VERSION", 0.1)
         self.min_config_version = 1.0
+
+        self.logger.debug("<magenta>[INIT]</magenta> MasterDnsVPNClient initialized.")
 
     # ---------------------------------------------------------
     # Connection Management
@@ -1136,22 +1175,8 @@ class MasterDnsVPNClient(PacketQueueMixin):
         """Run the MasterDnsVPN Client main logic."""
         self.logger.info("Setting up connections...")
         all_resolvers = 0
-        self.count_ping = 0
-        self.enqueue_seq = 0
-        self.main_queue = []
-        self.tx_event = asyncio.Event()
-        self.round_robin_index = 0
-        self.last_stream_id = 0
-
-        self.active_streams = {}
-        self.closed_streams = {}
-
-        self.priority_counts = {}
-        self.count_ping = 0
-        self.track_ack = set()
-        self.track_resend = set()
-        self.track_types = set()
-        self.track_data = set()
+        self._reset_tunnel_runtime_state()
+        self.session_id = 0
         try:
             self.session_restart_event = asyncio.Event()
 
@@ -1263,25 +1288,66 @@ class MasterDnsVPNClient(PacketQueueMixin):
     # ---------------------------------------------------------
     # TCP Multiplexing Logic & Handlers
     # ---------------------------------------------------------
-    async def _main_tunnel_loop(self):
-        """Start local TCP server and main worker tasks."""
-        self.logger.info("<blue>Entering VPN Tunnel Main Loop...</blue>")
-        self.main_queue = []
+    def _reset_tunnel_runtime_state(self) -> None:
+        """
+        Reset reconnect-sensitive runtime state.
+        IMPORTANT: MTU discovery fields are intentionally preserved.
+        """
+        self.count_ping = 0
+        self.enqueue_seq = 0
         self.round_robin_index = 0
+        self.last_stream_id = 0
+
+        self.main_queue = []
         self.tx_event = asyncio.Event()
 
         self.active_streams = {}
         self.closed_streams = {}
-        self.enqueue_seq = 0
-        self.last_stream_id = 0
-
         self.priority_counts = {}
-        self.count_ping = 0
         self.track_ack = set()
         self.track_resend = set()
         self.track_types = set()
         self.track_data = set()
+        self.rx_tasks = set()
 
+        ping_mgr = getattr(self, "ping_manager", None)
+        if ping_mgr:
+            now = time.monotonic()
+            ping_mgr.active_connections = 0
+            ping_mgr.last_data_activity = now
+            ping_mgr.last_ping_time = now
+
+    def _clear_runtime_state_after_disconnect(self) -> None:
+        """
+        Best-effort cleanup after tunnel disconnect/restart.
+        IMPORTANT: MTU discovery fields are intentionally preserved.
+        """
+        try:
+            self.main_queue.clear()
+            self.track_ack.clear()
+            self.track_resend.clear()
+            self.track_types.clear()
+            self.track_data.clear()
+            self.priority_counts.clear()
+            self.active_streams.clear()
+            self.closed_streams.clear()
+            self.rx_tasks.clear()
+        except Exception:
+            pass
+
+        self.tx_event = asyncio.Event()
+
+        ping_mgr = getattr(self, "ping_manager", None)
+        if ping_mgr:
+            now = time.monotonic()
+            ping_mgr.active_connections = 0
+            ping_mgr.last_data_activity = now
+            ping_mgr.last_ping_time = now
+
+    async def _main_tunnel_loop(self):
+        """Start local TCP server and main worker tasks."""
+        self.logger.info("<blue>Entering VPN Tunnel Main Loop...</blue>")
+        self._reset_tunnel_runtime_state()
         self.tunnel_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             buffer_size = int(self.config.get("SOCKET_BUFFER_SIZE", 8388608))
@@ -1315,6 +1381,8 @@ class MasterDnsVPNClient(PacketQueueMixin):
         listen_port = int(self.listener_port)
 
         server = None
+        stop_task = None
+        restart_task = None
         try:
             if sys.platform == "win32":
                 server = await asyncio.start_server(
@@ -1388,8 +1456,18 @@ class MasterDnsVPNClient(PacketQueueMixin):
                     pass
 
             close_tasks = []
+            is_restart = bool(
+                self.session_restart_event and self.session_restart_event.is_set()
+            )
+            close_reason = "Client Restarting" if is_restart else "Client App Closing"
             for sid in list(self.active_streams.keys()):
-                close_tasks.append(self.close_stream(sid, reason="Client App Closing"))
+                close_tasks.append(
+                    self.close_stream(
+                        sid,
+                        reason=close_reason,
+                        abortive=is_restart,
+                    )
+                )
 
             if close_tasks:
                 try:
@@ -1399,7 +1477,6 @@ class MasterDnsVPNClient(PacketQueueMixin):
                     )
                 except Exception:
                     pass
-
             for task in list(self.rx_tasks):
                 if not task.done():
                     task.cancel()
@@ -1415,27 +1492,24 @@ class MasterDnsVPNClient(PacketQueueMixin):
                     self.tunnel_sock.close()
                 except Exception:
                     pass
+                self.tunnel_sock = None
 
-            try:
-                self.main_queue.clear()
-                self.track_ack.clear()
-                self.track_resend.clear()
-                self.track_types.clear()
-                self.track_data.clear()
-                self.priority_counts.clear()
-            except Exception:
-                pass
+            self._clear_runtime_state_after_disconnect()
 
-        if not stop_task.done():
+        if stop_task and not stop_task.done():
             stop_task.cancel()
-        if not restart_task.done():
+        if restart_task and not restart_task.done():
             restart_task.cancel()
-        await asyncio.gather(stop_task, restart_task, return_exceptions=True)
+        if stop_task or restart_task:
+            await asyncio.gather(
+                *(t for t in (stop_task, restart_task) if t),
+                return_exceptions=True,
+            )
 
         self.logger.info(
             "<yellow>Cleaning up old connections before reconnecting...</yellow>"
         )
-        self.active_streams.clear()
+        self._clear_runtime_state_after_disconnect()
 
     async def _rx_worker(self):
         """Continuously listen for incoming VPN packets on the tunnel socket."""

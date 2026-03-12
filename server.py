@@ -45,10 +45,16 @@ class MasterDnsVPNServer(PacketQueueMixin):
 
     def __init__(self) -> None:
         """Initialize the MasterDnsVPNServer with configuration and logger."""
+        # ---------------------------------------------------------
+        # Runtime primitives
+        # ---------------------------------------------------------
         self.udp_sock: Optional[socket.socket] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.should_stop = asyncio.Event()
 
+        # ---------------------------------------------------------
+        # Config and logger bootstrap
+        # ---------------------------------------------------------
         self.config = load_config("server_config.toml")
         if not os.path.isfile(get_config_path("server_config.toml")):
             self.logger = getLogger(
@@ -66,19 +72,20 @@ class MasterDnsVPNServer(PacketQueueMixin):
         self.logger = getLogger(
             log_level=self.config.get("LOG_LEVEL", "INFO"), is_server=True
         )
+
+        # ---------------------------------------------------------
+        # Domain, protocol and SOCKS settings
+        # ---------------------------------------------------------
         self.allowed_domains = self.config.get("DOMAIN", [])
         self.allowed_domains_lower = tuple(
             sorted((d.lower() for d in self.allowed_domains), key=len, reverse=True)
         )
-        self.encryption_method: int = self.config.get("DATA_ENCRYPTION_METHOD", 1)
 
         self.protocol_type: str = self.config.get("PROTOCOL_TYPE", "TCP").upper()
         self.use_external_socks5: bool = self.config.get("USE_EXTERNAL_SOCKS5", False)
         self.socks5_auth: bool = self.config.get("SOCKS5_AUTH", False)
         self.socks5_user: str = str(self.config.get("SOCKS5_USER", ""))
         self.socks5_pass: str = str(self.config.get("SOCKS5_PASS", ""))
-
-        self.recently_closed_sessions = {}
 
         if self.protocol_type not in ("SOCKS5", "TCP"):
             self.logger.error(
@@ -87,32 +94,11 @@ class MasterDnsVPNServer(PacketQueueMixin):
             input("Press Enter to exit...")
             sys.exit(1)
 
-        self.sessions = {}
-        self._max_sessions = 255
-        self.free_session_ids = deque(range(1, self._max_sessions + 1))
-
+        # ---------------------------------------------------------
+        # Encryption and DNS parser settings
+        # ---------------------------------------------------------
+        self.encryption_method: int = self.config.get("DATA_ENCRYPTION_METHOD", 1)
         self.encrypt_key = get_encrypt_key(self.encryption_method)
-        self.logger.warning("=" * 60)
-        self.logger.warning(
-            "<yellow>MasterDnsVPN Server Starting with Configuration:</yellow>"
-        )
-        self.logger.warning("-" * 60)
-        self.logger.warning(
-            f"<red>Using encryption key: <green>{self.encrypt_key}</green></red>"
-        )
-        self.logger.warning(
-            f"<red>Encryption method: <green>{self.encryption_method}</green></red>"
-        )
-        self.logger.warning(
-            f"<yellow>Allowed domains: <cyan>{', '.join(self.allowed_domains)}</cyan></yellow>"
-        )
-        self.logger.warning("=" * 60)
-
-        self.dns_parser = DnsPacketParser(
-            logger=self.logger,
-            encryption_method=self.encryption_method,
-            encryption_key=self.encrypt_key,
-        )
 
         self.crypto_overhead = 0
         if self.encryption_method == 2:
@@ -120,11 +106,19 @@ class MasterDnsVPNServer(PacketQueueMixin):
         elif self.encryption_method in (3, 4, 5):
             self.crypto_overhead = 28
 
+        self.dns_parser = DnsPacketParser(
+            logger=self.logger,
+            encryption_method=self.encryption_method,
+            encryption_key=self.encrypt_key,
+        )
+
+        # ---------------------------------------------------------
+        # Forward target and performance configuration
+        # ---------------------------------------------------------
         self.forward_ip = self.config["FORWARD_IP"]
         self.forward_port = int(self.config["FORWARD_PORT"])
 
         self.max_packets_per_batch = int(self.config.get("MAX_PACKETS_PER_BATCH", 20))
-
         self.arq_window_size = int(self.config.get("ARQ_WINDOW_SIZE", 300))
         self.session_timeout = int(self.config.get("SESSION_TIMEOUT", 300))
         self.session_cleanup_interval = int(
@@ -133,20 +127,30 @@ class MasterDnsVPNServer(PacketQueueMixin):
         self.socks_handshake_timeout = float(
             self.config.get("SOCKS_HANDSHAKE_TIMEOUT", 120.0)
         )
-
         self.max_concurrent_requests = asyncio.Semaphore(
             int(self.config.get("MAX_CONCURRENT_REQUESTS", 1000))
         )
 
+        # ---------------------------------------------------------
+        # Session pools and server runtime state
+        # ---------------------------------------------------------
+        self.sessions = {}
+        self._max_sessions = 255
+        self.free_session_ids = deque(range(1, self._max_sessions + 1))
+        self.recently_closed_sessions = {}
+
         self._dns_task = None
         self._session_cleanup_task = None
         self._background_tasks = set()
+
+        # ---------------------------------------------------------
+        # Packet metadata and dispatch maps
+        # ---------------------------------------------------------
         self._valid_packet_types = {
             v
             for k, v in Packet_Type.__dict__.items()
             if not k.startswith("__") and isinstance(v, int)
         }
-
         self._block_packer = struct.Struct(">BHH")
         self._stream_packet_handlers = {
             Packet_Type.STREAM_DATA: self._handle_stream_data_packet,
@@ -231,8 +235,27 @@ class MasterDnsVPNServer(PacketQueueMixin):
             0x08: Packet_Type.SOCKS5_ADDRESS_TYPE_UNSUPPORTED,
         }
 
+        # ---------------------------------------------------------
+        # Config version markers and startup diagnostics
+        # ---------------------------------------------------------
         self.config_version = self.config.get("CONFIG_VERSION", 0.1)
         self.min_config_version = 1.0
+
+        self.logger.warning("=" * 60)
+        self.logger.warning(
+            "<yellow>MasterDnsVPN Server Starting with Configuration:</yellow>"
+        )
+        self.logger.warning("-" * 60)
+        self.logger.warning(
+            f"<red>Using encryption key: <green>{self.encrypt_key}</green></red>"
+        )
+        self.logger.warning(
+            f"<red>Encryption method: <green>{self.encryption_method}</green></red>"
+        )
+        self.logger.warning(
+            f"<yellow>Allowed domains: <cyan>{', '.join(self.allowed_domains)}</cyan></yellow>"
+        )
+        self.logger.warning("=" * 60)
 
         if self.config_version < self.min_config_version:
             self.logger.warning(
