@@ -3340,10 +3340,17 @@ class MasterDnsVPNClient(PacketQueueMixin):
             return
 
         if ptype in self._control_ack_types and stream_id_exists:
+            is_socks_fragment_ack = (
+                ptype == Packet_Type.SOCKS5_SYN_ACK and bool(data)
+            )
             arq = stream_data.get("stream")
-            if arq:
+            if arq and not is_socks_fragment_ack:
                 await arq.receive_control_ack(ptype, sn)
-            if ptype == Packet_Type.SOCKS5_SYN_ACK and "handshake_event" in stream_data:
+            if (
+                ptype == Packet_Type.SOCKS5_SYN_ACK
+                and not is_socks_fragment_ack
+                and "handshake_event" in stream_data
+            ):
                 stream_data["handshake_event"].set()
             self._send_ping_packet()
             return
