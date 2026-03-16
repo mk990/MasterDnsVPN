@@ -19,6 +19,7 @@ from bisect import bisect_left, bisect_right, insort
 from collections import defaultdict, deque
 from typing import Optional
 
+from build_version import get_build_version
 from dns_utils.ARQ import ARQ
 from dns_utils.compression import (
     Compression_Type,
@@ -61,6 +62,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
             pass
 
     def __init__(self) -> None:
+        self.build_version = get_build_version()
         # ---------------------------------------------------------
         # Runtime and lifecycle primitives
         # ---------------------------------------------------------
@@ -2797,6 +2799,10 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 f"<magenta>[LOOP]</magenta> Starting {num_workers} TX workers."
             )
 
+            self.logger.info(
+                f"<cyan>Build Version:</cyan> <yellow>{self.build_version}</yellow>"
+            )
+
             self.logger.info("<yellow>" + "=" * 80 + "</yellow>")
             self.logger.success(
                 "<fg #ff456d>📢 Join our Telegram channel: <cyan>@MasterDNSVPN</cyan> for support and updates! 📢</fg #ff456d>"
@@ -2806,7 +2812,6 @@ class MasterDnsVPNClient(PacketQueueMixin):
             self.logger.success(
                 "<cyan>GitHub:</cyan> <blue>https://github.com/masterking32/MasterDnsVPN</blue>"
             )
-
             self.logger.info("<yellow>" + "=" * 80 + "</yellow>")
             for _ in range(num_workers):
                 self.workers.append(self.loop.create_task(self._tx_worker()))
@@ -4152,6 +4157,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 )
             self.logger.info("=" * 60)
             self.logger.success("<magenta>Starting MasterDnsVPN Client...</magenta>")
+            self.logger.info(
+                f"<cyan>Build Version:</cyan> <yellow>{self.build_version}</yellow>"
+            )
             self.logger.success(
                 "<cyan>GitHub:</cyan> <blue>https://github.com/masterking32/MasterDnsVPN</blue>"
             )

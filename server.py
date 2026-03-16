@@ -20,6 +20,7 @@ from bisect import bisect_left, bisect_right, insort
 from collections import deque
 from typing import Optional
 
+from build_version import get_build_version
 from dns_utils.ARQ import ARQ
 from dns_utils.compression import (
     Compression_Type,
@@ -66,6 +67,7 @@ class MasterDnsVPNServer(PacketQueueMixin):
 
     def __init__(self) -> None:
         """Initialize the MasterDnsVPNServer with configuration and logger."""
+        self.build_version = get_build_version()
         # ---------------------------------------------------------
         # Runtime primitives
         # ---------------------------------------------------------
@@ -3132,6 +3134,7 @@ class MasterDnsVPNServer(PacketQueueMixin):
         """Initialize sockets, start background tasks, and wait for shutdown signal."""
         try:
             self.logger.info("<magenta>MasterDnsVPN Server starting ...</magenta>")
+
             self.loop = asyncio.get_running_loop()
 
             host = self.config.get("UDP_HOST", "0.0.0.0")
@@ -3174,6 +3177,9 @@ class MasterDnsVPNServer(PacketQueueMixin):
                 )
             else:
                 self.logger.info("<yellow>CPU worker threads disabled.</yellow>")
+            self.logger.info(
+                f"<cyan>Build Version:</cyan> <yellow>{self.build_version}</yellow>"
+            )
 
             if sys.platform == "win32":
                 try:
