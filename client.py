@@ -118,7 +118,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
         # ---------------------------------------------------------
         self.resolvers: list = self._load_resolvers_from_file()
         self.allowed_resolver_sources = {
-            str(r).strip().lower() for r in self.resolvers if str(r).strip()
+            str(r[0]).strip().lower()
+            for r in self.resolvers
+            if isinstance(r, tuple) and r and str(r[0]).strip()
         }
         self.domains: list = self.config.get("DOMAINS", [])
         self.domains_lower: tuple = tuple(
@@ -380,8 +382,12 @@ class MasterDnsVPNClient(PacketQueueMixin):
                     if not line or line.startswith("#"):
                         continue
                     try:
-                        if "/" in line:
-                            network = ipaddress.ip_network(line, strict=False)
+                        parsed_target, resolver_port = self._parse_resolver_entry(line)
+                        if isinstance(
+                            parsed_target,
+                            (ipaddress.IPv4Network, ipaddress.IPv6Network),
+                        ):
+                            network = parsed_target
                             usable_hosts = network.num_addresses
                             if network.version == 4 and network.prefixlen < 31:
                                 usable_hosts = max(0, usable_hosts - 2)
@@ -396,28 +402,28 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
                             expanded_count = 0
                             for host_ip in network.hosts():
-                                normalized_ip = str(host_ip)
-                                if normalized_ip in seen:
+                                resolver_entry = (str(host_ip), int(resolver_port))
+                                if resolver_entry in seen:
                                     continue
-                                seen.add(normalized_ip)
-                                resolvers.append(normalized_ip)
+                                seen.add(resolver_entry)
+                                resolvers.append(resolver_entry)
                                 expanded_count += 1
 
                             self.logger.debug(
-                                f"Expanded resolver subnet '<cyan>{line}</cyan>' to <cyan>{expanded_count}</cyan> IPs."
+                                f"Expanded resolver subnet '<cyan>{line}</cyan>' to <cyan>{expanded_count}</cyan> IPs on port <cyan>{resolver_port}</cyan>."
                             )
                             continue
 
-                        normalized_ip = str(ipaddress.ip_address(line))
+                        resolver_entry = (str(parsed_target), int(resolver_port))
                     except ValueError:
                         self.logger.warning(
                             f"Invalid resolver IP/subnet '<yellow>{line}</yellow>' ignored."
                         )
                         continue
-                    if normalized_ip in seen:
+                    if resolver_entry in seen:
                         continue
-                    seen.add(normalized_ip)
-                    resolvers.append(normalized_ip)
+                    seen.add(resolver_entry)
+                    resolvers.append(resolver_entry)
         except Exception as exc:
             self.logger.error(
                 f"Failed to read resolver file '<cyan>client_resolvers.txt</cyan>': {exc}"
@@ -436,6 +442,94 @@ class MasterDnsVPNClient(PacketQueueMixin):
             sys.exit(1)
 
         return resolvers
+
+    def _parse_resolver_entry(
+        self, line: str
+    ) -> tuple[
+        ipaddress.IPv4Address
+        | ipaddress.IPv6Address
+        | ipaddress.IPv4Network
+        | ipaddress.IPv6Network,
+        int,
+    ]:
+        text = str(line or "").strip()
+        if not text:
+            raise ValueError("empty resolver entry")
+
+        try:
+            if "/" in text:
+                return ipaddress.ip_network(text, strict=False), 53
+            return ipaddress.ip_address(text), 53
+        except ValueError:
+            pass
+
+        host_part = ""
+        port_part = ""
+        if text.startswith("["):
+            end = text.find("]")
+            if end == -1:
+                raise ValueError("invalid bracketed resolver")
+            host_part = text[1:end].strip()
+            remainder = text[end + 1 :].strip()
+            if remainder.startswith(":"):
+                port_part = remainder[1:].strip()
+        else:
+            host_part, sep, port_part = text.rpartition(":")
+            if not sep:
+                raise ValueError("invalid resolver entry")
+            host_part = host_part.strip()
+            port_part = port_part.strip()
+
+        if not host_part or not port_part or not port_part.isdigit():
+            raise ValueError("invalid resolver port")
+
+        port = int(port_part)
+        if port < 1 or port > 65535:
+            raise ValueError("resolver port out of range")
+
+        if "/" in host_part:
+            return ipaddress.ip_network(host_part, strict=False), port
+        return ipaddress.ip_address(host_part), port
+
+    def _format_resolver_endpoint(self, resolver: str, port: int) -> str:
+        if ":" in str(resolver) and not str(resolver).startswith("["):
+            return f"[{resolver}]:{int(port)}"
+        return f"{resolver}:{int(port)}"
+
+    def _get_connection_resolver_port(self, connection: dict) -> int:
+        return int(connection.get("resolver_port", 53) or 53)
+
+    def _get_connection_resolver_addr(self, connection: dict) -> tuple[str, int]:
+        cached = connection.get("_resolver_addr")
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and str(cached[0]).strip()
+            and int(cached[1]) > 0
+        ):
+            return str(cached[0]), int(cached[1])
+
+        resolver = str(connection.get("resolver", "")).strip()
+        resolver_port = self._get_connection_resolver_port(connection)
+        resolver_addr = (resolver, resolver_port)
+        connection["_resolver_addr"] = resolver_addr
+        return resolver_addr
+
+    def _get_connection_resolver_label(self, connection: dict) -> str:
+        cached = str(connection.get("_resolver_label", "") or "").strip()
+        if cached:
+            return cached
+
+        resolver, resolver_port = self._get_connection_resolver_addr(connection)
+        resolver_label = self._format_resolver_endpoint(resolver, resolver_port)
+        connection["_resolver_label"] = resolver_label
+        return resolver_label
+
+    def _make_server_key(self, resolver: str, resolver_port: int, domain: str) -> str:
+        return (
+            f"{self._format_resolver_endpoint(resolver, resolver_port)}:"
+            f"{str(domain or '').strip().lower()}"
+        )
 
     def _apply_scale_profile(self, total_pairs: int) -> None:
         """Apply runtime tuning profile based on resolver-domain pair count."""
@@ -492,15 +586,26 @@ class MasterDnsVPNClient(PacketQueueMixin):
         self.connections_map = []
         for domain in unique_domains:
             for resolver in unique_resolvers:
-                conn = {"domain": domain, "resolver": resolver}
+                resolver_host, resolver_port = resolver
+                resolver_port = int(resolver_port)
+                resolver_label = self._format_resolver_endpoint(
+                    resolver_host, resolver_port
+                )
+                conn = {
+                    "domain": domain,
+                    "resolver": resolver_host,
+                    "resolver_port": resolver_port,
+                    "_resolver_addr": (resolver_host, resolver_port),
+                    "_resolver_label": resolver_label,
+                }
                 conn["_key"] = self._get_connection_key(conn)
                 self._init_recheck_meta(conn)
                 self.connections_map.append(conn)
 
     def _get_connection_key(self, connection: dict) -> str:
-        resolver = str(connection.get("resolver", "")).strip()
+        resolver, resolver_port = self._get_connection_resolver_addr(connection)
         domain = str(connection.get("domain", "")).strip().lower()
-        key = f"{resolver}:{domain}"
+        key = self._make_server_key(resolver, resolver_port, domain)
         connection["_key"] = key
         return key
 
@@ -544,7 +649,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
             return ""
 
         conn = connection or {}
-        ip_value = str(conn.get("resolver", ""))
+        ip_value = self._get_connection_resolver_label(conn) if conn else ""
         domain_value = str(conn.get("domain", ""))
         up_mtu_value = str(conn.get("upload_mtu_bytes", 0))
         down_mtu_value = str(conn.get("download_mtu_bytes", 0))
@@ -722,7 +827,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
         self._reset_server_runtime_state(key)
         self._refresh_balancer_valid_servers()
 
-        resolver = connection.get("resolver", "N/A")
+        resolver = self._get_connection_resolver_label(connection)
         self.logger.warning(
             f"<yellow>DNS server <cyan>{resolver}</cyan> disabled due to: <red>{cause}</red></yellow>"
         )
@@ -747,7 +852,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
         connection["is_valid"] = True
         self._refresh_balancer_valid_servers()
 
-        resolver = connection.get("resolver", "N/A")
+        resolver = self._get_connection_resolver_label(connection)
         self.logger.info(
             f"<green>DNS server <cyan>{resolver}</cyan> re-enabled and added back to active list.</green>"
         )
@@ -935,7 +1040,8 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
         if addr:
             source_ip = str(addr[0]).strip().lower()
-            server_key = f"{source_ip}:{matched_domain}"
+            source_port = int(addr[1]) if len(addr) > 1 else 53
+            server_key = self._make_server_key(source_ip, source_port, matched_domain)
             sent_time = self._track_server_success(server_key)
             if sent_time is not None:
                 self.balancer.report_success(
@@ -1056,9 +1162,10 @@ class MasterDnsVPNClient(PacketQueueMixin):
         mtu_size,
         is_retry=False,
     ):
+        resolver_label = self._format_resolver_endpoint(dns_server, dns_port)
         if not is_retry:
             self.logger.debug(
-                f"<magenta>[MTU Probe]</magenta> Testing Upload MTU: <yellow>{mtu_size}</yellow> bytes via <cyan>{dns_server}</cyan>"
+                f"<magenta>[MTU Probe]</magenta> Testing Upload MTU: <yellow>{mtu_size}</yellow> bytes via <cyan>{resolver_label}</cyan>"
             )
 
         mtu_char_len, mtu_bytes = self.dns_parser.calculate_upload_mtu(
@@ -1088,7 +1195,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
         if not response:
             self._log_mtu_probe(
-                f"<yellow>⚠️ Upload test failed: Upload MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{dns_server}</cyan> for <cyan>{domain}</cyan></yellow>",
+                f"<yellow>⚠️ Upload test failed: Upload MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan></yellow>",
                 level="info",
                 is_retry=is_retry,
             )
@@ -1099,21 +1206,21 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
         if packet_type == Packet_Type.MTU_UP_RES:
             self._log_mtu_probe(
-                f"<yellow>🟢 Upload test passed: Upload MTU <green>{mtu_size}</green> bytes via <cyan>{dns_server}</cyan> for <cyan>{domain}</cyan></yellow>",
+                f"<yellow>🟢 Upload test passed: Upload MTU <green>{mtu_size}</green> bytes via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan></yellow>",
                 level="success",
                 is_retry=is_retry,
             )
             return True
         elif packet_type == Packet_Type.ERROR_DROP:
             self._log_mtu_probe(
-                f"<yellow>⚠️ Upload test failed (Server Dropped Packet): Upload MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{dns_server}</cyan> for <cyan>{domain}</cyan></yellow>",
+                f"<yellow>⚠️ Upload test failed (Server Dropped Packet): Upload MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan></yellow>",
                 level="info",
                 is_retry=is_retry,
             )
             return False
 
         self._log_mtu_probe(
-            f"<yellow>⚠️ Upload test failed: Upload MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{dns_server}</cyan> for <cyan>{domain}</cyan></yellow>",
+            f"<yellow>⚠️ Upload test failed: Upload MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan></yellow>",
             level="info",
             is_retry=is_retry,
         )
@@ -1128,9 +1235,10 @@ class MasterDnsVPNClient(PacketQueueMixin):
         up_mtu_bytes,
         is_retry=False,
     ):
+        resolver_label = self._format_resolver_endpoint(dns_server, dns_port)
         if not is_retry:
             self.logger.debug(
-                f"<magenta>[MTU Probe]</magenta> Testing Download MTU: <yellow>{mtu_size}</yellow> bytes via <cyan>{dns_server}</cyan>"
+                f"<magenta>[MTU Probe]</magenta> Testing Download MTU: <yellow>{mtu_size}</yellow> bytes via <cyan>{resolver_label}</cyan>"
             )
 
         worst_header = self.dns_parser.get_max_vpn_header_raw_size()
@@ -1170,7 +1278,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
         if not response:
             self._log_mtu_probe(
-                f"<yellow>⚠️ Download test failed: Download MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{dns_server}</cyan> for <cyan>{domain}</cyan> (No Response)</yellow>",
+                f"<yellow>⚠️ Download test failed: Download MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan> (No Response)</yellow>",
                 level="info",
                 is_retry=is_retry,
             )
@@ -1182,21 +1290,21 @@ class MasterDnsVPNClient(PacketQueueMixin):
         if packet_type == Packet_Type.MTU_DOWN_RES:
             if returned_data and len(returned_data) == effective_download_size:
                 self._log_mtu_probe(
-                    f"<yellow>🟢 Download test passed: Download MTU <green>{mtu_size}</green> bytes via <cyan>{dns_server}</cyan> for <cyan>{domain}</cyan></yellow>",
+                    f"<yellow>🟢 Download test passed: Download MTU <green>{mtu_size}</green> bytes via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan></yellow>",
                     level="success",
                     is_retry=is_retry,
                 )
                 return True
             else:
                 self._log_mtu_probe(
-                    f"<yellow>⚠️ Download test failed: Download MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{dns_server}</cyan> for <cyan>{domain}</cyan> (Data Size Mismatch)</yellow>",
+                    f"<yellow>⚠️ Download test failed: Download MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan> (Data Size Mismatch)</yellow>",
                     level="info",
                     is_retry=is_retry,
                 )
                 return False
 
         self._log_mtu_probe(
-            f"<yellow>⚠️ Download test failed: Download MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{dns_server}</cyan> for <cyan>{domain}</cyan> (Unexpected Packet Type)</yellow>",
+            f"<yellow>⚠️ Download test failed: Download MTU <cyan>{mtu_size}</cyan> bytes via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan> (Unexpected Packet Type)</yellow>",
             level="info",
             is_retry=is_retry,
         )
@@ -1650,7 +1758,6 @@ class MasterDnsVPNClient(PacketQueueMixin):
             connection["_was_valid_once"] = False
             connection["_recheck_next_at"] = 0.0
 
-        sem = asyncio.Semaphore(max(1, self.mtu_test_parallelism))
         counters = {
             "completed": 0,
             "valid": 0,
@@ -1663,91 +1770,109 @@ class MasterDnsVPNClient(PacketQueueMixin):
             if not connection or self.should_stop.is_set():
                 return
 
-            async with sem:
-                if self.should_stop.is_set():
-                    return
+            if self.should_stop.is_set():
+                return
 
-                domain = connection.get("domain")
-                resolver = connection.get("resolver")
-                dns_port = 53
+            domain = connection.get("domain")
+            resolver, dns_port = self._get_connection_resolver_addr(connection)
+            resolver_label = self._get_connection_resolver_label(connection)
 
-                self.logger.debug(
-                    f"<blue>Testing connection <yellow>{domain}</yellow> via <cyan>{resolver}</cyan> (<yellow>{server_id} / {total_conns}</yellow>)...</blue>"
+            self.logger.debug(
+                f"<blue>Testing connection <yellow>{domain}</yellow> via <cyan>{resolver_label}</cyan> (<yellow>{server_id} / {total_conns}</yellow>)...</blue>"
+            )
+
+            up_valid, up_mtu_bytes, up_mtu_char = await self.test_upload_mtu_size(
+                domain, resolver, dns_port, self.max_upload_mtu
+            )
+
+            if not up_valid or (
+                self.min_upload_mtu > 0 and up_mtu_bytes < self.min_upload_mtu
+            ):
+                connection["_recheck_next_at"] = (
+                    time.monotonic() + self.recheck_inactive_interval_seconds
                 )
-
-                up_valid, up_mtu_bytes, up_mtu_char = await self.test_upload_mtu_size(
-                    domain, resolver, dns_port, self.max_upload_mtu
-                )
-
-                if not up_valid or (
-                    self.min_upload_mtu > 0 and up_mtu_bytes < self.min_upload_mtu
-                ):
-                    connection["_recheck_next_at"] = (
-                        time.monotonic() + self.recheck_inactive_interval_seconds
-                    )
-                    async with counters_lock:
-                        counters["completed"] += 1
-                        counters["reject_upload"] += 1
-                        completed = counters["completed"]
-                        valid_now = counters["valid"]
-                        rejected_now = (
-                            counters["reject_upload"] + counters["reject_download"]
-                        )
-                    self.logger.warning(
-                        f"<red>❌ Rejected ({completed}/{total_conns}): <cyan>{domain}</cyan> via <cyan>{resolver}</cyan> | reason=<yellow>UPLOAD_MTU</yellow> | value=<cyan>{up_mtu_bytes}</cyan> | totals: valid=<green>{valid_now}</green>, rejected=<red>{rejected_now}</red></red>"
-                    )
-                    return
-
-                down_valid, down_mtu_bytes = await self.test_download_mtu_size(
-                    domain, resolver, dns_port, self.max_download_mtu, up_mtu_bytes
-                )
-
-                if not down_valid or (
-                    self.min_download_mtu > 0 and down_mtu_bytes < self.min_download_mtu
-                ):
-                    connection["_recheck_next_at"] = (
-                        time.monotonic() + self.recheck_inactive_interval_seconds
-                    )
-                    async with counters_lock:
-                        counters["completed"] += 1
-                        counters["reject_download"] += 1
-                        completed = counters["completed"]
-                        valid_now = counters["valid"]
-                        rejected_now = (
-                            counters["reject_upload"] + counters["reject_download"]
-                        )
-                    self.logger.warning(
-                        f"<red>❌ Rejected ({completed}/{total_conns}): <cyan>{domain}</cyan> via <cyan>{resolver}</cyan> | reason=<yellow>DOWNLOAD_MTU</yellow> | value=<cyan>{down_mtu_bytes}</cyan> | totals: valid=<green>{valid_now}</green>, rejected=<red>{rejected_now}</red></red>"
-                    )
-                    return
-
-                connection["is_valid"] = True
-                connection["upload_mtu_bytes"] = up_mtu_bytes
-                connection["upload_mtu_chars"] = up_mtu_char
-                connection["download_mtu_bytes"] = down_mtu_bytes
-                connection["packet_loss"] = 0
-                connection["_recheck_fail_count"] = 0
-                connection["_recheck_next_at"] = 0.0
-                connection["_was_valid_once"] = True
-
                 async with counters_lock:
                     counters["completed"] += 1
-                    counters["valid"] += 1
+                    counters["reject_upload"] += 1
                     completed = counters["completed"]
                     valid_now = counters["valid"]
                     rejected_now = (
                         counters["reject_upload"] + counters["reject_download"]
                     )
-                self.logger.info(
-                    f"<green>✅ Accepted ({completed}/{total_conns}): <cyan>{domain}</cyan> via <cyan>{resolver}</cyan> | upload=<cyan>{up_mtu_bytes}</cyan> | download=<cyan>{down_mtu_bytes}</cyan> | totals: valid=<green>{valid_now}</green>, rejected=<red>{rejected_now}</red></green>"
+                self.logger.warning(
+                    f"<red>❌ Rejected ({completed}/{total_conns}): <cyan>{domain}</cyan> via <cyan>{resolver_label}</cyan> | reason=<yellow>UPLOAD_MTU</yellow> | value=<cyan>{up_mtu_bytes}</cyan> | totals: valid=<green>{valid_now}</green>, rejected=<red>{rejected_now}</red></red>"
                 )
+                return
 
-                self._append_mtu_success_line(mtu_output_path, connection)
+            down_valid, down_mtu_bytes = await self.test_download_mtu_size(
+                domain, resolver, dns_port, self.max_download_mtu, up_mtu_bytes
+            )
+
+            if not down_valid or (
+                self.min_download_mtu > 0 and down_mtu_bytes < self.min_download_mtu
+            ):
+                connection["_recheck_next_at"] = (
+                    time.monotonic() + self.recheck_inactive_interval_seconds
+                )
+                async with counters_lock:
+                    counters["completed"] += 1
+                    counters["reject_download"] += 1
+                    completed = counters["completed"]
+                    valid_now = counters["valid"]
+                    rejected_now = (
+                        counters["reject_upload"] + counters["reject_download"]
+                    )
+                self.logger.warning(
+                    f"<red>❌ Rejected ({completed}/{total_conns}): <cyan>{domain}</cyan> via <cyan>{resolver_label}</cyan> | reason=<yellow>DOWNLOAD_MTU</yellow> | value=<cyan>{down_mtu_bytes}</cyan> | totals: valid=<green>{valid_now}</green>, rejected=<red>{rejected_now}</red></red>"
+                )
+                return
+
+            connection["is_valid"] = True
+            connection["upload_mtu_bytes"] = up_mtu_bytes
+            connection["upload_mtu_chars"] = up_mtu_char
+            connection["download_mtu_bytes"] = down_mtu_bytes
+            connection["packet_loss"] = 0
+            connection["_recheck_fail_count"] = 0
+            connection["_recheck_next_at"] = 0.0
+            connection["_was_valid_once"] = True
+
+            async with counters_lock:
+                counters["completed"] += 1
+                counters["valid"] += 1
+                completed = counters["completed"]
+                valid_now = counters["valid"]
+                rejected_now = counters["reject_upload"] + counters["reject_download"]
+            self.logger.info(
+                f"<green>✅ Accepted ({completed}/{total_conns}): <cyan>{domain}</cyan> via <cyan>{resolver_label}</cyan> | upload=<cyan>{up_mtu_bytes}</cyan> | download=<cyan>{down_mtu_bytes}</cyan> | totals: valid=<green>{valid_now}</green>, rejected=<red>{rejected_now}</red></green>"
+            )
+
+            self._append_mtu_success_line(mtu_output_path, connection)
+
+        async def _mtu_test_worker(work_queue: asyncio.Queue) -> None:
+            while not self.should_stop.is_set():
+                item = await work_queue.get()
+                if item is None:
+                    work_queue.task_done()
+                    return
+
+                try:
+                    server_id, connection = item
+                    await _test_one_connection(server_id, connection)
+                finally:
+                    work_queue.task_done()
+
+        work_queue = asyncio.Queue()
+        for idx, conn in enumerate(self.connections_map, start=1):
+            if conn:
+                work_queue.put_nowait((idx, conn))
+
+        worker_count = min(max(1, self.mtu_test_parallelism), work_queue.qsize() or 1)
+        for _ in range(worker_count):
+            work_queue.put_nowait(None)
 
         tasks = [
-            asyncio.create_task(_test_one_connection(idx, conn))
-            for idx, conn in enumerate(self.connections_map, start=1)
-            if conn
+            asyncio.create_task(_mtu_test_worker(work_queue))
+            for _ in range(worker_count)
         ]
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1795,23 +1920,24 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
     async def _recheck_one_inactive_connection(self, connection: dict) -> bool:
         domain = connection.get("domain")
-        resolver = connection.get("resolver")
+        resolver, dns_port = self._get_connection_resolver_addr(connection)
         if not domain or not resolver:
             return False
 
         synced_up = int(self.synced_upload_mtu or 0)
         synced_down = int(self.synced_download_mtu or 0)
+        resolver_label = self._get_connection_resolver_label(connection)
 
         if synced_up <= 0 or synced_down <= 0:
             self.logger.debug(
-                f"Cannot recheck connection {domain} via {resolver} because synced MTU values are not available."
+                f"Cannot recheck connection {domain} via {resolver_label} because synced MTU values are not available."
             )
             return False
 
         up_valid = await self.send_upload_mtu_test(
             domain,
             resolver,
-            53,
+            dns_port,
             synced_up,
             is_retry=False,
         )
@@ -1826,7 +1952,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
         down_valid = await self.send_download_mtu_test(
             domain,
             resolver,
-            53,
+            dns_port,
             synced_down,
             synced_up,
             is_retry=False,
@@ -1956,7 +2082,8 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 continue
 
             domain = selected_conn.get("domain")
-            resolver = selected_conn.get("resolver")
+            resolver, dns_port = self._get_connection_resolver_addr(selected_conn)
+            resolver_label = self._get_connection_resolver_label(selected_conn)
 
             sync_token = os.urandom(8)
 
@@ -1981,7 +2108,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
             if not dns_queries:
                 self.logger.error(
-                    f"<yellow>Failed to build MTU sync via <cyan>{resolver}</cyan> for <cyan>{domain}</cyan>, Retrying...</yellow>"
+                    f"<yellow>Failed to build MTU sync via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan>, Retrying...</yellow>"
                 )
                 await asyncio.sleep(0.2)
                 continue
@@ -1991,7 +2118,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
                     return False
 
                 response = await self._send_and_receive_dns(
-                    dns_queries[0], resolver, 53, 2.0
+                    dns_queries[0], resolver, dns_port, 2.0
                 )
 
                 if response:
@@ -2017,7 +2144,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
                     await asyncio.sleep(0.5)
 
             self.logger.warning(
-                f"<yellow>MTU sync failed via <cyan>{resolver}</cyan> for <cyan>{domain}</cyan>. Retrying overall process...</yellow>"
+                f"<yellow>MTU sync failed via <cyan>{resolver_label}</cyan> for <cyan>{domain}</cyan>. Retrying overall process...</yellow>"
             )
             await asyncio.sleep(0.2)
 
@@ -2040,7 +2167,8 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 continue
 
             domain = selected_conn.get("domain")
-            resolver = selected_conn.get("resolver")
+            resolver, dns_port = self._get_connection_resolver_addr(selected_conn)
+            resolver_label = self._get_connection_resolver_label(selected_conn)
 
             init_token = os.urandom(8).hex().encode("ascii")
             flag_byte = b"\x01" if self.base_encode_responses else b"\x00"
@@ -2066,7 +2194,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
             if not dns_queries:
                 self.logger.error(
-                    f"Failed to build session init DNS query via {resolver} for {domain}, Retrying..."
+                    f"Failed to build session init DNS query via {resolver_label} for {domain}, Retrying..."
                 )
                 await asyncio.sleep(0.2)
                 continue
@@ -2076,7 +2204,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
                     return False
 
                 response = await self._send_and_receive_dns(
-                    dns_queries[0], resolver, 53, self.timeout
+                    dns_queries[0], resolver, dns_port, self.timeout
                 )
 
                 if response:
@@ -3283,11 +3411,12 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
                 for query_packet in query_packets:
                     try:
+                        resolver_addr = self._get_connection_resolver_addr(conn)
                         await async_sendto(
                             self.loop,
                             self.tunnel_sock,
                             query_packet,
-                            (conn["resolver"], 53),
+                            resolver_addr,
                         )
                     except Exception as _:
                         pass

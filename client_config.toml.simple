@@ -50,7 +50,17 @@ SOCKS_HANDSHAKE_TIMEOUT = 300.0
 # 3) Resolver Selection & DNS Strategy
 # ------------------------------------------------------------------------------
 
-# Resolver pool moved to client_resolvers.txt (one IP per line).
+# Resolver pool moved to client_resolvers.txt.
+# Supported formats per line:
+# - IP
+# - IP:PORT
+# - CIDR
+# - CIDR:PORT
+# Examples:
+# - 1.1.1.1
+# - 1.1.1.1:5353
+# - 1.1.1.0/24
+# - 1.1.1.0/24:99
 # This file must exist next to client executable/config file.
 
 # Send each DNS query N times for reliability in lossy networks.
