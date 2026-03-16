@@ -51,13 +51,13 @@ jobs:
         run: |
           $shortSha = "${{ github.sha }}".Substring(0, 7)
           $buildVersion = "test-${{ github.run_number }}-$shortSha"
-          Set-Content -Path build_version.py -Value @"
-          BUILD_VERSION = ""$buildVersion""
+          @"
+          BUILD_VERSION = "$buildVersion"
 
 
           def get_build_version() -> str:
-              return str(BUILD_VERSION or ""dev"").strip() or ""dev""
-          "@ -Encoding UTF8
+              return str(BUILD_VERSION or "dev").strip() or "dev"
+          "@ | Set-Content -Path build_version.py -Encoding UTF8
 
       - name: Generate build version module (non-Windows)
         if: ${{ matrix.os != 'windows-latest' }}
