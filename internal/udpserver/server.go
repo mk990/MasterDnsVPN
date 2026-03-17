@@ -9,6 +9,7 @@ package udpserver
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"sync"
@@ -182,6 +183,14 @@ func (s *Server) worker(ctx context.Context, conn *net.UDPConn, reqCh <-chan req
 func (s *Server) handlePacket(packet []byte) []byte {
 	parsed, err := dnsparser.ParsePacketLite(packet)
 	if err != nil {
+		response, responseErr := dnsparser.BuildEmptyNoErrorResponse(packet)
+		if responseErr == nil {
+			s.log.Debugf(
+				"[DNS] <yellow>Malformed DNS Packet Rejected</yellow> id=<cyan>%d</cyan> action=<green>empty-noerror</green>",
+				binary.BigEndian.Uint16(packet[:2]),
+			)
+			return response
+		}
 		return nil
 	}
 
@@ -213,7 +222,27 @@ func (s *Server) handlePacket(packet []byte) []byte {
 		)
 	}
 
-	return packet
+	if !s.allowDNSPacket(parsed) {
+		response, responseErr := dnsparser.BuildEmptyNoErrorResponse(packet)
+		if responseErr == nil {
+			s.log.Debugf(
+				"[DNS] <yellow>DNS Packet Rejected By Policy</yellow> id=<cyan>%d</cyan> action=<green>empty-noerror</green>",
+				parsed.Header.ID,
+			)
+			return response
+		}
+		return nil
+	}
+
+	response, responseErr := dnsparser.BuildEmptyNoErrorResponse(packet)
+	if responseErr != nil {
+		return nil
+	}
+	return response
+}
+
+func (s *Server) allowDNSPacket(_ dnsparser.LitePacket) bool {
+	return true
 }
 
 func (s *Server) onDrop(addr *net.UDPAddr) {

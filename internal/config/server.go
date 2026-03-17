@@ -57,7 +57,7 @@ func defaultServerConfig() ServerConfig {
 		SocketBufferSize:      8 * 1024 * 1024,
 		MaxConcurrentRequests: 4096,
 		DNSRequestWorkers:     workers,
-		MaxPacketSize:         4096,
+		MaxPacketSize:         65535,
 		DropLogIntervalSecs:   2.0,
 		DataEncryptionMethod:  1,
 		EncryptionKeyFile:     "encrypt_key.txt",
@@ -102,7 +102,7 @@ func LoadServerConfig(filename string) (ServerConfig, error) {
 		cfg.DNSRequestWorkers = defaultServerConfig().DNSRequestWorkers
 	}
 	if cfg.MaxPacketSize <= 0 {
-		cfg.MaxPacketSize = 4096
+		cfg.MaxPacketSize = 65535
 	}
 	if cfg.DropLogIntervalSecs <= 0 {
 		cfg.DropLogIntervalSecs = 2.0

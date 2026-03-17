@@ -25,7 +25,8 @@ MAX_CONCURRENT_REQUESTS = 4096
 DNS_REQUEST_WORKERS = 8
 
 # Maximum inbound UDP packet size to read in one operation.
-MAX_PACKET_SIZE = 4096
+# Keep this large if you want full EDNS UDP packets without app-level truncation.
+MAX_PACKET_SIZE = 65535
 
 # Minimum interval between overload/drop warning logs.
 DROP_LOG_INTERVAL_SECONDS = 2.0
