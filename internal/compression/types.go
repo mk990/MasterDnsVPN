@@ -25,6 +25,25 @@ const (
 
 const availableTypeMask uint8 = (1 << TypeOff) | (1 << TypeZLIB)
 
+var normalizedPackedPairNibble = [16]uint8{
+	TypeOff,
+	TypeZSTD,
+	TypeLZ4,
+	TypeZLIB,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+	TypeOff,
+}
+
 var (
 	deflateBufferPool = sync.Pool{
 		New: func() any {
@@ -64,11 +83,17 @@ func NormalizeAvailableType(value uint8) uint8 {
 }
 
 func PackPair(uploadType uint8, downloadType uint8) uint8 {
-	return (NormalizeType(uploadType) << 4) | NormalizeType(downloadType)
+	if uploadType > TypeZLIB {
+		uploadType = TypeOff
+	}
+	if downloadType > TypeZLIB {
+		downloadType = TypeOff
+	}
+	return (uploadType << 4) | downloadType
 }
 
 func SplitPair(value uint8) (uint8, uint8) {
-	return NormalizeType((value >> 4) & 0x0F), NormalizeType(value & 0x0F)
+	return normalizedPackedPairNibble[(value>>4)&0x0F], normalizedPackedPairNibble[value&0x0F]
 }
 
 func TypeName(value uint8) string {

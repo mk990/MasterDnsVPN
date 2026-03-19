@@ -712,10 +712,7 @@ func buildCompressionMask(values []int) uint8 {
 }
 
 func resolveCompressionType(requested uint8, allowedMask uint8) uint8 {
-	if requested > compression.TypeZLIB {
-		return compression.TypeOff
-	}
-	if allowedMask&(1<<requested) != 0 {
+	if requested <= compression.TypeZLIB && allowedMask&(1<<requested) != 0 {
 		return requested
 	}
 	return compression.TypeOff

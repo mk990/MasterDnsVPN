@@ -75,6 +75,13 @@ func (s *streamOutboundStore) ConfigureSession(sessionID uint8, maxPackedBlocks 
 	}
 	limit := uint16(max(1, maxPackedBlocks))
 	s.mu.Lock()
+	if s.configuredPackedCaps[sessionID] == limit {
+		session := s.sessions[sessionID]
+		if session == nil || session.maxPackedBlocks == int(limit) {
+			s.mu.Unlock()
+			return
+		}
+	}
 	s.configuredPackedCaps[sessionID] = limit
 	session := s.sessions[sessionID]
 	if session != nil && session.maxPackedBlocks != int(limit) {
