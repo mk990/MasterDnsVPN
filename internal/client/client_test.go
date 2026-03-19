@@ -1133,12 +1133,19 @@ func TestClientStreamTXLoopAdvancesQueueOnDataAck(t *testing.T) {
 		t.Fatalf("expected different sequence numbers for queued packets: %v", seen)
 	}
 
-	stream.mu.Lock()
-	queueLen := len(stream.TXQueue)
-	inflightLen := len(stream.TXInFlight)
-	stream.mu.Unlock()
-	if queueLen != 0 || inflightLen != 0 {
-		t.Fatalf("expected queue to drain after acks, queueLen=%d inflightLen=%d", queueLen, inflightLen)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stream.mu.Lock()
+		queueLen := len(stream.TXQueue)
+		inflightLen := len(stream.TXInFlight)
+		stream.mu.Unlock()
+		if queueLen == 0 && inflightLen == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected queue to drain after acks, queueLen=%d inflightLen=%d", queueLen, inflightLen)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1184,6 +1191,39 @@ func TestClientStreamTXAckRemovesOutOfOrderInflightPacket(t *testing.T) {
 		if packet.SequenceNum == secondSeq {
 			t.Fatal("acked packet must be removed from inflight queue")
 		}
+	}
+}
+
+func TestQueueStreamRSTClearsPendingData(t *testing.T) {
+	c := New(config.ClientConfig{}, nil, nil)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	stream := c.createStream(22, serverConn)
+	defer c.deleteStream(stream.ID)
+
+	if err := c.queueStreamPacket(stream, Enums.PACKET_STREAM_DATA, []byte("one")); err != nil {
+		t.Fatalf("queueStreamPacket returned error: %v", err)
+	}
+	if err := c.queueStreamPacket(stream, Enums.PACKET_STREAM_DATA, []byte("two")); err != nil {
+		t.Fatalf("queueStreamPacket returned error: %v", err)
+	}
+	if packet, _, stop := nextClientStreamTX(stream, 4); stop || packet == nil {
+		t.Fatalf("expected first packet to move inflight, stop=%v packet=%v", stop, packet)
+	}
+
+	if err := c.queueStreamPacket(stream, Enums.PACKET_STREAM_RST, nil); err != nil {
+		t.Fatalf("queueStreamPacket returned error: %v", err)
+	}
+
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if len(stream.TXInFlight) != 0 {
+		t.Fatalf("expected inflight data to be cleared on reset, got=%d", len(stream.TXInFlight))
+	}
+	if len(stream.TXQueue) != 1 || stream.TXQueue[0].PacketType != Enums.PACKET_STREAM_RST {
+		t.Fatalf("expected reset to become sole queued packet, queue=%+v", stream.TXQueue)
 	}
 }
 

@@ -64,6 +64,11 @@ func (s *streamOutboundStore) Enqueue(sessionID uint8, packet VpnProto.Packet) {
 		s.sessions[sessionID] = session
 	}
 	packet.Payload = append([]byte(nil), packet.Payload...)
+	if packet.PacketType == Enums.PACKET_STREAM_RST {
+		pruneOutboundStreamPackets(session, packet.StreamID)
+		prependOutboundPacket(&session.queue, packet)
+		return
+	}
 	session.queue = append(session.queue, packet)
 }
 
@@ -206,6 +211,45 @@ func matchesStreamOutboundAck(pendingType uint8, ackType uint8) bool {
 func cloneOutboundPacket(packet VpnProto.Packet) VpnProto.Packet {
 	packet.Payload = append([]byte(nil), packet.Payload...)
 	return packet
+}
+
+func pruneOutboundStreamPackets(session *streamOutboundSession, streamID uint16) {
+	if session == nil {
+		return
+	}
+	if len(session.queue) != 0 {
+		filteredQueue := session.queue[:0]
+		for _, packet := range session.queue {
+			if packet.StreamID != streamID {
+				filteredQueue = append(filteredQueue, packet)
+			}
+		}
+		for idx := len(filteredQueue); idx < len(session.queue); idx++ {
+			session.queue[idx] = VpnProto.Packet{}
+		}
+		session.queue = filteredQueue
+	}
+	if len(session.pending) != 0 {
+		filteredPending := session.pending[:0]
+		for _, pending := range session.pending {
+			if pending.Packet.StreamID != streamID {
+				filteredPending = append(filteredPending, pending)
+			}
+		}
+		for idx := len(filteredPending); idx < len(session.pending); idx++ {
+			session.pending[idx] = outboundPendingPacket{}
+		}
+		session.pending = filteredPending
+	}
+}
+
+func prependOutboundPacket(queue *[]VpnProto.Packet, packet VpnProto.Packet) {
+	if queue == nil {
+		return
+	}
+	*queue = append(*queue, VpnProto.Packet{})
+	copy((*queue)[1:], (*queue)[:len(*queue)-1])
+	(*queue)[0] = packet
 }
 
 func (s *streamOutboundStore) effectiveWindow() int {

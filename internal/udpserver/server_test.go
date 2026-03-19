@@ -529,6 +529,43 @@ func TestStreamOutboundStoreSupportsWindowAndOutOfOrderAck(t *testing.T) {
 	}
 }
 
+func TestStreamOutboundStoreResetClearsStreamBacklog(t *testing.T) {
+	store := newStreamOutboundStore(4)
+	now := time.Now()
+
+	store.Enqueue(9, VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_DATA,
+		StreamID:    33,
+		SequenceNum: 1,
+		Payload:     []byte("one"),
+	})
+	store.Enqueue(9, VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_DATA,
+		StreamID:    44,
+		SequenceNum: 1,
+		Payload:     []byte("other"),
+	})
+	first, ok := store.Next(9, now)
+	if !ok || first.StreamID != 33 || first.PacketType != Enums.PACKET_STREAM_DATA {
+		t.Fatalf("unexpected first packet: ok=%v packet=%+v", ok, first)
+	}
+
+	store.Enqueue(9, VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_RST,
+		StreamID:    33,
+		SequenceNum: 2,
+	})
+
+	next, ok := store.Next(9, now)
+	if !ok || next.PacketType != Enums.PACKET_STREAM_RST || next.StreamID != 33 {
+		t.Fatalf("expected reset to preempt same-stream backlog, got ok=%v packet=%+v", ok, next)
+	}
+	after, ok := store.Next(9, now)
+	if !ok || after.StreamID != 44 || after.PacketType != Enums.PACKET_STREAM_DATA {
+		t.Fatalf("expected unrelated stream packet to remain queued, got ok=%v packet=%+v", ok, after)
+	}
+}
+
 func TestHandlePacketRespondsToStreamLifecyclePackets(t *testing.T) {
 	codec, err := security.NewCodec(0, "")
 	if err != nil {

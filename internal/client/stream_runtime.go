@@ -225,13 +225,21 @@ func (c *Client) queueStreamPacket(stream *clientStream, packetType uint8, paylo
 	}
 	if packetType == Enums.PACKET_STREAM_RST {
 		stream.ResetSent = true
+		clearClientStreamDataLocked(stream)
 	}
-	stream.TXQueue = append(stream.TXQueue, clientStreamTXPacket{
+	packet := clientStreamTXPacket{
 		PacketType:  packetType,
 		SequenceNum: sequenceNum,
 		Payload:     append([]byte(nil), payload...),
 		RetryDelay:  streamTXInitialRetryDelay,
-	})
+	}
+	if packetType == Enums.PACKET_STREAM_RST {
+		stream.TXQueue = append(stream.TXQueue, clientStreamTXPacket{})
+		copy(stream.TXQueue[1:], stream.TXQueue[:len(stream.TXQueue)-1])
+		stream.TXQueue[0] = packet
+	} else {
+		stream.TXQueue = append(stream.TXQueue, packet)
+	}
 	notifyStreamWake(stream)
 	return nil
 }
@@ -488,4 +496,34 @@ func (c *Client) effectiveStreamTXWindow() int {
 		return 32
 	}
 	return c.streamTXWindow
+}
+
+func clearClientStreamDataLocked(stream *clientStream) {
+	if stream == nil {
+		return
+	}
+	if len(stream.TXQueue) != 0 {
+		filteredQueue := stream.TXQueue[:0]
+		for _, packet := range stream.TXQueue {
+			if packet.PacketType == Enums.PACKET_STREAM_RST {
+				filteredQueue = append(filteredQueue, packet)
+			}
+		}
+		for idx := len(filteredQueue); idx < len(stream.TXQueue); idx++ {
+			stream.TXQueue[idx] = clientStreamTXPacket{}
+		}
+		stream.TXQueue = filteredQueue
+	}
+	if len(stream.TXInFlight) != 0 {
+		filteredInFlight := stream.TXInFlight[:0]
+		for _, packet := range stream.TXInFlight {
+			if packet.PacketType == Enums.PACKET_STREAM_RST {
+				filteredInFlight = append(filteredInFlight, packet)
+			}
+		}
+		for idx := len(filteredInFlight); idx < len(stream.TXInFlight); idx++ {
+			stream.TXInFlight[idx] = clientStreamTXPacket{}
+		}
+		stream.TXInFlight = filteredInFlight
+	}
 }
