@@ -20,6 +20,7 @@ import (
 const maxClientStreamFollowUps = 16
 const streamTXInitialRetryDelay = 350 * time.Millisecond
 const streamTXMaxRetryDelay = 2 * time.Second
+const streamTXMinRetryDelay = 120 * time.Millisecond
 
 var ErrClientStreamClosed = errors.New("client stream closed")
 var ErrClientStreamBackpressure = errors.New("client stream send queue full")
@@ -34,6 +35,7 @@ func (c *Client) createStream(streamID uint16, conn net.Conn) *clientStream {
 		TXInFlight:     make([]clientStreamTXPacket, 0, c.effectiveStreamTXWindow()),
 		TXWake:         make(chan struct{}, 1),
 		StopCh:         make(chan struct{}),
+		retryBase:      streamTXInitialRetryDelay,
 	}
 	c.storeStream(stream)
 	if c.stream0Runtime != nil {
@@ -236,7 +238,7 @@ func (c *Client) queueStreamPacket(stream *clientStream, packetType uint8, paylo
 		SequenceNum: sequenceNum,
 		Payload:     append([]byte(nil), payload...),
 		CreatedAt:   stream.LastActivityAt,
-		RetryDelay:  streamTXInitialRetryDelay,
+		RetryDelay:  streamRetryBaseLocked(stream),
 	}
 	if packetType == Enums.PACKET_STREAM_RST {
 		stream.TXQueue = append(stream.TXQueue, clientStreamTXPacket{})
@@ -309,7 +311,7 @@ func (c *Client) runClientStreamTXLoop(stream *clientStream, timeout time.Durati
 				rescheduleClientStreamTX(stream, packet.SequenceNum)
 				continue
 			}
-			acked := ackClientStreamTXByResponse(stream, packet.PacketType, response)
+			acked := ackClientStreamTXByResponse(stream, packet.PacketType, response, time.Now())
 			if err := c.handleFollowUpServerPacket(response, timeout); err != nil {
 				if !acked {
 					rescheduleClientStreamTX(stream, packet.SequenceNum)
@@ -351,7 +353,7 @@ func nextClientStreamTX(stream *clientStream, windowSize int) (*clientStreamTXPa
 		stream.TXQueue[0] = clientStreamTXPacket{}
 		stream.TXQueue = stream.TXQueue[1:]
 		if packet.RetryDelay <= 0 {
-			packet.RetryDelay = streamTXInitialRetryDelay
+			packet.RetryDelay = streamRetryBaseLocked(stream)
 		}
 		packet.RetryAt = now
 		packet.Scheduled = false
@@ -396,7 +398,7 @@ func rescheduleClientStreamTX(stream *clientStream, sequenceNum uint16) {
 		}
 		delay := stream.TXInFlight[idx].RetryDelay
 		if delay <= 0 {
-			delay = streamTXInitialRetryDelay
+			delay = streamRetryBaseLocked(stream)
 		}
 		stream.TXInFlight[idx].Scheduled = false
 		stream.TXInFlight[idx].RetryAt = time.Now().Add(delay)
@@ -424,12 +426,13 @@ func markClientStreamTXScheduled(stream *clientStream, sequenceNum uint16) bool 
 			return false
 		}
 		stream.TXInFlight[idx].Scheduled = true
+		stream.TXInFlight[idx].LastSentAt = time.Now()
 		return true
 	}
 	return false
 }
 
-func ackClientStreamTX(stream *clientStream, sequenceNum uint16) {
+func ackClientStreamTX(stream *clientStream, sequenceNum uint16, ackedAt time.Time) {
 	if stream == nil {
 		return
 	}
@@ -439,6 +442,7 @@ func ackClientStreamTX(stream *clientStream, sequenceNum uint16) {
 		if stream.TXInFlight[idx].SequenceNum != sequenceNum {
 			continue
 		}
+		updateClientStreamRTO(stream, stream.TXInFlight[idx], ackedAt)
 		copy(stream.TXInFlight[idx:], stream.TXInFlight[idx+1:])
 		lastIdx := len(stream.TXInFlight) - 1
 		stream.TXInFlight[lastIdx] = clientStreamTXPacket{}
@@ -447,7 +451,7 @@ func ackClientStreamTX(stream *clientStream, sequenceNum uint16) {
 	}
 }
 
-func ackClientStreamTXByResponse(stream *clientStream, sentPacketType uint8, response VpnProto.Packet) bool {
+func ackClientStreamTXByResponse(stream *clientStream, sentPacketType uint8, response VpnProto.Packet, ackedAt time.Time) bool {
 	if stream == nil {
 		return false
 	}
@@ -457,7 +461,7 @@ func ackClientStreamTXByResponse(stream *clientStream, sentPacketType uint8, res
 	if response.StreamID != stream.ID {
 		return false
 	}
-	ackClientStreamTX(stream, response.SequenceNum)
+	ackClientStreamTX(stream, response.SequenceNum, ackedAt)
 	return true
 }
 
@@ -665,11 +669,59 @@ func (c *Client) expireClientStreamTX(stream *clientStream, now time.Time) bool 
 			PacketType:  Enums.PACKET_STREAM_RST,
 			SequenceNum: stream.NextSequence,
 			CreatedAt:   now,
-			RetryDelay:  streamTXInitialRetryDelay,
+			RetryDelay:  streamRetryBaseLocked(stream),
 		}
 		notifyStreamWake(stream)
 		return true
 	}
 
 	return false
+}
+
+func streamRetryBaseLocked(stream *clientStream) time.Duration {
+	if stream == nil || stream.retryBase <= 0 {
+		return streamTXInitialRetryDelay
+	}
+	if stream.retryBase < streamTXMinRetryDelay {
+		return streamTXMinRetryDelay
+	}
+	if stream.retryBase > streamTXMaxRetryDelay {
+		return streamTXMaxRetryDelay
+	}
+	return stream.retryBase
+}
+
+func updateClientStreamRTO(stream *clientStream, packet clientStreamTXPacket, ackedAt time.Time) {
+	if stream == nil || packet.RetryCount != 0 || packet.LastSentAt.IsZero() {
+		return
+	}
+	sample := ackedAt.Sub(packet.LastSentAt)
+	if sample <= 0 {
+		return
+	}
+	if sample < streamTXMinRetryDelay {
+		sample = streamTXMinRetryDelay
+	}
+	if sample > streamTXMaxRetryDelay {
+		sample = streamTXMaxRetryDelay
+	}
+	if stream.srtt <= 0 {
+		stream.srtt = sample
+		stream.rttVar = sample / 2
+	} else {
+		diff := stream.srtt - sample
+		if diff < 0 {
+			diff = -diff
+		}
+		stream.rttVar = (3*stream.rttVar + diff) / 4
+		stream.srtt = (7*stream.srtt + sample) / 8
+	}
+	rto := stream.srtt + 4*stream.rttVar
+	if rto < streamTXMinRetryDelay {
+		rto = streamTXMinRetryDelay
+	}
+	if rto > streamTXMaxRetryDelay {
+		rto = streamTXMaxRetryDelay
+	}
+	stream.retryBase = rto
 }

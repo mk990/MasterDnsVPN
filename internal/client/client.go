@@ -98,6 +98,9 @@ type clientStream struct {
 	TXWake         chan struct{}
 	StopCh         chan struct{}
 	stopOnce       sync.Once
+	retryBase      time.Duration
+	srtt           time.Duration
+	rttVar         time.Duration
 }
 
 type clientStreamTXPacket struct {
@@ -105,6 +108,7 @@ type clientStreamTXPacket struct {
 	SequenceNum uint16
 	Payload     []byte
 	CreatedAt   time.Time
+	LastSentAt  time.Time
 	RetryDelay  time.Duration
 	RetryAt     time.Time
 	RetryCount  int

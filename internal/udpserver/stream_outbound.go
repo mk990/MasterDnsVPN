@@ -17,6 +17,7 @@ import (
 
 const streamOutboundInitialRetryDelay = 350 * time.Millisecond
 const streamOutboundMaxRetryDelay = 2 * time.Second
+const streamOutboundMinRetryDelay = 120 * time.Millisecond
 
 type streamOutboundStore struct {
 	mu         sync.Mutex
@@ -28,15 +29,19 @@ type streamOutboundStore struct {
 type outboundPendingPacket struct {
 	Packet     VpnProto.Packet
 	CreatedAt  time.Time
+	LastSentAt time.Time
 	RetryAt    time.Time
 	RetryDelay time.Duration
 	RetryCount int
 }
 
 type streamOutboundSession struct {
-	queue    []VpnProto.Packet
-	pending  []outboundPendingPacket
-	rrCursor uint16
+	queue     []VpnProto.Packet
+	pending   []outboundPendingPacket
+	rrCursor  uint16
+	retryBase time.Duration
+	srtt      time.Duration
+	rttVar    time.Duration
 }
 
 func newStreamOutboundStore(windowSize int, queueLimit int) *streamOutboundStore {
@@ -69,9 +74,10 @@ func (s *streamOutboundStore) Enqueue(sessionID uint8, packet VpnProto.Packet) b
 	session := s.sessions[sessionID]
 	if session == nil {
 		session = &streamOutboundSession{
-			queue:    make([]VpnProto.Packet, 0, 8),
-			pending:  make([]outboundPendingPacket, 0, s.effectiveWindow()),
-			rrCursor: 0,
+			queue:     make([]VpnProto.Packet, 0, 8),
+			pending:   make([]outboundPendingPacket, 0, s.effectiveWindow()),
+			rrCursor:  0,
+			retryBase: streamOutboundInitialRetryDelay,
 		}
 		s.sessions[sessionID] = session
 	}
@@ -107,8 +113,9 @@ func (s *streamOutboundStore) Next(sessionID uint8, now time.Time) (VpnProto.Pac
 		session.pending = append(session.pending, outboundPendingPacket{
 			Packet:     packet,
 			CreatedAt:  now,
-			RetryAt:    now.Add(streamOutboundInitialRetryDelay),
-			RetryDelay: streamOutboundInitialRetryDelay,
+			LastSentAt: now,
+			RetryAt:    now.Add(streamOutboundRetryBase(session)),
+			RetryDelay: streamOutboundRetryBase(session),
 		})
 		return cloneOutboundPacket(packet), true
 	}
@@ -125,8 +132,9 @@ func (s *streamOutboundStore) Next(sessionID uint8, now time.Time) (VpnProto.Pac
 	packet := session.pending[selectedIdx].Packet
 	delay := session.pending[selectedIdx].RetryDelay
 	if delay <= 0 {
-		delay = streamOutboundInitialRetryDelay
+		delay = streamOutboundRetryBase(session)
 	}
+	session.pending[selectedIdx].LastSentAt = now
 	session.pending[selectedIdx].RetryAt = now.Add(delay)
 	session.pending[selectedIdx].RetryCount++
 	delay *= 2
@@ -196,6 +204,7 @@ func (s *streamOutboundStore) Ack(sessionID uint8, packetType uint8, streamID ui
 		if pending.Packet.StreamID != streamID || pending.Packet.SequenceNum != sequenceNum {
 			continue
 		}
+		updateStreamOutboundRTO(session, pending, time.Now())
 		copy(session.pending[idx:], session.pending[idx+1:])
 		lastIdx := len(session.pending) - 1
 		session.pending[lastIdx] = outboundPendingPacket{}
@@ -415,4 +424,52 @@ func (s *streamOutboundStore) effectiveQueueLimit() int {
 		return 8192
 	}
 	return s.queueLimit
+}
+
+func streamOutboundRetryBase(session *streamOutboundSession) time.Duration {
+	if session == nil || session.retryBase <= 0 {
+		return streamOutboundInitialRetryDelay
+	}
+	if session.retryBase < streamOutboundMinRetryDelay {
+		return streamOutboundMinRetryDelay
+	}
+	if session.retryBase > streamOutboundMaxRetryDelay {
+		return streamOutboundMaxRetryDelay
+	}
+	return session.retryBase
+}
+
+func updateStreamOutboundRTO(session *streamOutboundSession, pending outboundPendingPacket, ackedAt time.Time) {
+	if session == nil || pending.RetryCount != 0 || pending.LastSentAt.IsZero() {
+		return
+	}
+	sample := ackedAt.Sub(pending.LastSentAt)
+	if sample <= 0 {
+		return
+	}
+	if sample < streamOutboundMinRetryDelay {
+		sample = streamOutboundMinRetryDelay
+	}
+	if sample > streamOutboundMaxRetryDelay {
+		sample = streamOutboundMaxRetryDelay
+	}
+	if session.srtt <= 0 {
+		session.srtt = sample
+		session.rttVar = sample / 2
+	} else {
+		diff := session.srtt - sample
+		if diff < 0 {
+			diff = -diff
+		}
+		session.rttVar = (3*session.rttVar + diff) / 4
+		session.srtt = (7*session.srtt + sample) / 8
+	}
+	rto := session.srtt + 4*session.rttVar
+	if rto < streamOutboundMinRetryDelay {
+		rto = streamOutboundMinRetryDelay
+	}
+	if rto > streamOutboundMaxRetryDelay {
+		rto = streamOutboundMaxRetryDelay
+	}
+	session.retryBase = rto
 }

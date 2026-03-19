@@ -1421,7 +1421,7 @@ func TestClientStreamTXAckRemovesOutOfOrderInflightPacket(t *testing.T) {
 	secondSeq := stream.TXInFlight[1].SequenceNum
 	stream.mu.Unlock()
 
-	ackClientStreamTX(stream, secondSeq)
+	ackClientStreamTX(stream, secondSeq, time.Now())
 
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
@@ -1541,6 +1541,43 @@ func TestExpireClientStreamTXQueuesRSTOnRetryBudgetExceeded(t *testing.T) {
 	}
 	if len(stream.TXQueue) != 1 || stream.TXQueue[0].PacketType != Enums.PACKET_STREAM_RST {
 		t.Fatalf("expected queued reset packet, queue=%+v", stream.TXQueue)
+	}
+}
+
+func TestClientStreamRTTAdjustsRetryBaseAfterAck(t *testing.T) {
+	c := New(config.ClientConfig{}, nil, nil)
+	stream := c.createStream(9, nil)
+
+	if err := c.queueStreamPacket(stream, Enums.PACKET_STREAM_DATA, []byte("alpha")); err != nil {
+		t.Fatalf("queueStreamPacket returned error: %v", err)
+	}
+	packet, _, stop := nextClientStreamTX(stream, 1)
+	if stop || packet == nil {
+		t.Fatalf("expected inflight packet, stop=%v packet=%v", stop, packet)
+	}
+
+	sentAt := time.Now().Add(-150 * time.Millisecond)
+	stream.mu.Lock()
+	stream.TXInFlight[0].LastSentAt = sentAt
+	stream.TXInFlight[0].Scheduled = true
+	stream.mu.Unlock()
+
+	ackClientStreamTX(stream, packet.SequenceNum, sentAt.Add(150*time.Millisecond))
+
+	if err := c.queueStreamPacket(stream, Enums.PACKET_STREAM_DATA, []byte("beta")); err != nil {
+		t.Fatalf("queueStreamPacket returned error: %v", err)
+	}
+
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if len(stream.TXQueue) != 1 {
+		t.Fatalf("expected one queued packet, got=%d", len(stream.TXQueue))
+	}
+	if stream.TXQueue[0].RetryDelay == streamTXInitialRetryDelay {
+		t.Fatalf("expected adaptive retry base to change from default, got=%v", stream.TXQueue[0].RetryDelay)
+	}
+	if stream.TXQueue[0].RetryDelay < streamTXMinRetryDelay || stream.TXQueue[0].RetryDelay > streamTXMaxRetryDelay {
+		t.Fatalf("expected retry delay to stay clamped, got=%v", stream.TXQueue[0].RetryDelay)
 	}
 }
 

@@ -738,6 +738,67 @@ func TestStreamOutboundStorePrioritizesControlOverQueuedData(t *testing.T) {
 	}
 }
 
+func TestStreamOutboundStoreAdaptsRetryBaseAfterAck(t *testing.T) {
+	store := newStreamOutboundStore(1, 8)
+	now := time.Now()
+
+	if !store.Enqueue(7, VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_DATA,
+		StreamID:    3,
+		SequenceNum: 1,
+		Payload:     []byte("alpha"),
+	}) {
+		t.Fatal("expected enqueue to succeed")
+	}
+
+	packet, ok := store.Next(7, now)
+	if !ok || packet.SequenceNum != 1 {
+		t.Fatalf("expected first outbound packet, ok=%v packet=%+v", ok, packet)
+	}
+
+	store.mu.Lock()
+	session := store.sessions[7]
+	if session == nil || len(session.pending) != 1 {
+		store.mu.Unlock()
+		t.Fatalf("expected one pending packet, session=%v", session)
+	}
+	session.pending[0].LastSentAt = now.Add(-150 * time.Millisecond)
+	store.mu.Unlock()
+
+	if !store.Enqueue(7, VpnProto.Packet{
+		PacketType:  Enums.PACKET_STREAM_DATA,
+		StreamID:    3,
+		SequenceNum: 2,
+		Payload:     []byte("beta"),
+	}) {
+		t.Fatal("expected second enqueue to succeed")
+	}
+
+	if !store.Ack(7, Enums.PACKET_STREAM_DATA_ACK, 3, 1) {
+		t.Fatal("expected ack to succeed")
+	}
+	_, ok = store.Next(7, now.Add(time.Second))
+	if !ok {
+		t.Fatal("expected second outbound packet")
+	}
+
+	store.mu.Lock()
+	session = store.sessions[7]
+	if session == nil || len(session.pending) != 1 {
+		store.mu.Unlock()
+		t.Fatalf("expected active pending packet after second send, session=%v", session)
+	}
+	base := session.pending[0].RetryDelay
+	store.mu.Unlock()
+
+	if base == streamOutboundInitialRetryDelay {
+		t.Fatalf("expected adaptive retry base to change from default, got=%v", base)
+	}
+	if base < streamOutboundMinRetryDelay || base > streamOutboundMaxRetryDelay {
+		t.Fatalf("expected retry delay to stay clamped, got=%v", base)
+	}
+}
+
 func TestHandlePacketRespondsToStreamLifecyclePackets(t *testing.T) {
 	codec, err := security.NewCodec(0, "")
 	if err != nil {
