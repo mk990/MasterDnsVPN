@@ -78,6 +78,7 @@ type Server struct {
 	packetPool               sync.Pool
 	droppedPackets           atomic.Uint64
 	lastDropLogUnix          atomic.Int64
+	pongNonce                atomic.Uint32
 }
 
 type request struct {
@@ -400,20 +401,20 @@ func (s *Server) handlePostSessionPacket(parsed DnsParser.LitePacket, decision d
 	switch vpnPacket.PacketType {
 	case Enums.PACKET_PING:
 		return s.handlePingRequest(vpnPacket, sessionRecord)
+	case Enums.PACKET_STREAM_DATA, Enums.PACKET_STREAM_RESEND:
+		return s.handleStreamDataRequest(vpnPacket, sessionRecord)
+	case Enums.PACKET_STREAM_DATA_ACK, Enums.PACKET_STREAM_FIN_ACK, Enums.PACKET_STREAM_RST_ACK, Enums.PACKET_STREAM_SYN_ACK:
+		return s.handleStreamAckPacket(vpnPacket, sessionRecord)
 	case Enums.PACKET_DNS_QUERY_REQ:
 		return s.handleDNSQueryRequest(parsed, decision, vpnPacket, sessionRecord)
 	case Enums.PACKET_STREAM_SYN:
 		return s.handleStreamSynRequest(vpnPacket, sessionRecord)
 	case Enums.PACKET_SOCKS5_SYN:
 		return s.handleSOCKS5SynRequest(vpnPacket, sessionRecord)
-	case Enums.PACKET_STREAM_DATA, Enums.PACKET_STREAM_RESEND:
-		return s.handleStreamDataRequest(vpnPacket, sessionRecord)
 	case Enums.PACKET_STREAM_FIN:
 		return s.handleStreamFinRequest(vpnPacket, sessionRecord)
 	case Enums.PACKET_STREAM_RST:
 		return s.handleStreamRSTRequest(vpnPacket, sessionRecord)
-	case Enums.PACKET_STREAM_DATA_ACK, Enums.PACKET_STREAM_FIN_ACK, Enums.PACKET_STREAM_RST_ACK, Enums.PACKET_STREAM_SYN_ACK:
-		return s.handleStreamAckPacket(vpnPacket, sessionRecord)
 	default:
 		_ = parsed
 		return false
@@ -551,10 +552,27 @@ func (s *Server) serveQueuedOrPong(questionPacket []byte, requestName string, se
 	if queued, ok := s.streamOutbound.Next(sessionID, now); ok {
 		return s.buildSessionVPNResponse(questionPacket, requestName, sessionRecord, queued)
 	}
+	payload := s.nextPongPayload()
+
 	return s.buildSessionVPNResponse(questionPacket, requestName, sessionRecord, VpnProto.Packet{
 		PacketType: Enums.PACKET_PONG,
-		Payload:    []byte("PO:idle"),
+		Payload:    payload[:],
 	})
+}
+
+func (s *Server) nextPongPayload() [7]byte {
+	var payload [7]byte
+	payload[0] = 'P'
+	payload[1] = 'O'
+	payload[2] = ':'
+
+	nonce := s.pongNonce.Add(1)
+	nonce ^= nonce << 13
+	nonce ^= nonce >> 17
+	nonce ^= nonce << 5
+	binary.BigEndian.PutUint32(payload[3:], nonce)
+
+	return payload
 }
 
 func deferredSessionLaneForPacket(packet VpnProto.Packet) deferredSessionLane {
