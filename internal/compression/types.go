@@ -23,6 +23,8 @@ const (
 	DefaultMinSize = 100
 )
 
+const availableTypeMask uint8 = (1 << TypeOff) | (1 << TypeZLIB)
+
 var (
 	deflateBufferPool = sync.Pool{
 		New: func() any {
@@ -43,26 +45,19 @@ var (
 )
 
 func NormalizeType(value uint8) uint8 {
-	switch value {
-	case TypeOff, TypeZSTD, TypeLZ4, TypeZLIB:
+	if value <= TypeZLIB {
 		return value
-	default:
-		return TypeOff
 	}
+	return TypeOff
 }
 
 func IsTypeAvailable(value uint8) bool {
-	switch NormalizeType(value) {
-	case TypeOff, TypeZLIB:
-		return true
-	default:
-		return false
-	}
+	value = NormalizeType(value)
+	return availableTypeMask&(1<<value) != 0
 }
 
 func NormalizeAvailableType(value uint8) uint8 {
-	value = NormalizeType(value)
-	if !IsTypeAvailable(value) {
+	if value > TypeZLIB || availableTypeMask&(1<<value) == 0 {
 		return TypeOff
 	}
 	return value

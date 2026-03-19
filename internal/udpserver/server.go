@@ -580,7 +580,9 @@ func buildCompressionMask(values []int) uint8 {
 }
 
 func resolveCompressionType(requested uint8, allowedMask uint8) uint8 {
-	requested = compression.NormalizeType(requested)
+	if requested > compression.TypeZLIB {
+		return compression.TypeOff
+	}
 	if allowedMask&(1<<requested) != 0 {
 		return requested
 	}
