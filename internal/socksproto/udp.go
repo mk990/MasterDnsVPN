@@ -41,16 +41,49 @@ func ParseUDPDatagram(packet []byte) (UDPDatagram, error) {
 
 	return UDPDatagram{
 		Target:  target,
-		Payload: append([]byte(nil), packet[offset:]...),
+		Payload: packet[offset:],
 	}, nil
 }
 
 func BuildUDPDatagram(target Target, payload []byte) []byte {
-	targetBytes := BuildTargetPayload(target)
-	packet := make([]byte, 0, 3+len(targetBytes)+len(payload))
-	packet = append(packet, 0x00, 0x00, 0x00)
-	packet = append(packet, targetBytes...)
-	packet = append(packet, payload...)
+	targetLen := 1 + 2 // Type + Port
+	var hostBytes []byte
+	switch target.AddressType {
+	case AddressTypeIPv4:
+		targetLen += 4
+	case AddressTypeIPv6:
+		targetLen += 16
+	case AddressTypeDomain:
+		hostBytes = []byte(target.Host)
+		targetLen += 1 + len(hostBytes)
+	}
+
+	packet := make([]byte, 3+targetLen+len(payload))
+	// Header: RSV(2) + FRAG(1)
+	// packet[0], packet[1], packet[2] are already 0
+
+	offset := 3
+	packet[offset] = target.AddressType
+	offset++
+
+	switch target.AddressType {
+	case AddressTypeIPv4:
+		copy(packet[offset:offset+4], ParseIPv4(target.Host))
+		offset += 4
+	case AddressTypeIPv6:
+		copy(packet[offset:offset+16], ParseIPv6(target.Host))
+		offset += 16
+	case AddressTypeDomain:
+		packet[offset] = byte(len(hostBytes))
+		offset++
+		copy(packet[offset:offset+len(hostBytes)], hostBytes)
+		offset += len(hostBytes)
+	}
+
+	binary.BigEndian.PutUint16(packet[offset:offset+2], target.Port)
+	offset += 2
+	copy(packet[offset:], payload)
+
 	return packet
 }
 
