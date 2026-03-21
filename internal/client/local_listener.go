@@ -17,9 +17,6 @@ func (c *Client) runLocalTCPAcceptLoop(ctx context.Context, addr string, readyLo
 	if c == nil {
 		return nil
 	}
-	if err := c.startStream0Runtime(ctx); err != nil {
-		return err
-	}
 
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {

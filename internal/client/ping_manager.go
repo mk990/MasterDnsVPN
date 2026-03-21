@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	Enums "masterdnsvpn-go/internal/enums"
 )
 
 const (
@@ -138,7 +140,9 @@ func (p *PingManager) pingLoop() {
 		lastPing := time.Unix(0, p.lastPingSentAt.Load())
 		if now.Sub(lastPing) >= interval {
 			if p.client.SessionReady() {
-				if p.client.stream0Runtime != nil && p.client.stream0Runtime.QueuePing() {
+				payload, err := buildClientPingPayload()
+				if err == nil {
+					p.client.QueueControlPacket(Enums.PACKET_PING, payload)
 					p.NotifyPingSent()
 				}
 			}

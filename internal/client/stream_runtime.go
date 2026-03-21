@@ -35,9 +35,6 @@ func (c *Client) createStream(streamID uint16, conn net.Conn) *clientStream {
 		stream.LastResolverFailover = now
 	}
 	c.storeStream(stream)
-	if c.stream0Runtime != nil {
-		c.stream0Runtime.NotifyDNSActivity()
-	}
 	go c.runClientStreamTXLoop(stream, 5*time.Second)
 	return stream
 }
@@ -293,16 +290,10 @@ func (c *Client) sendStreamAckOneWay(packetType uint8, streamID uint16, sequence
 }
 
 func (c *Client) sendStreamProtocolOneWay(packetType uint8, streamID uint16, sequenceNum uint16, payload []byte, timeout time.Duration) error {
-	if c == nil || streamID == 0 {
+	if c == nil {
 		return ErrClientStreamClosed
 	}
 	if !c.SessionReady() {
-		return ErrTunnelDNSDispatchFailed
-	}
-	if c.stream0Runtime != nil && c.stream0Runtime.IsRunning() {
-		if c.stream0Runtime.QueueStreamPacket(streamID, packetType, sequenceNum, payload) {
-			return nil
-		}
 		return ErrTunnelDNSDispatchFailed
 	}
 
@@ -448,19 +439,14 @@ func (c *Client) runClientStreamTXLoop(stream *clientStream, timeout time.Durati
 				len(packet.Payload),
 			)
 		}
-		if c.stream0Runtime != nil && c.stream0Runtime.IsRunning() {
-			if !c.stream0Runtime.QueueStreamPacket(stream.ID, packetType, packet.SequenceNum, packet.Payload) {
-				time.Sleep(25 * time.Millisecond)
-				continue
-			}
-		} else if err := c.sendStreamProtocolOneWay(packetType, stream.ID, packet.SequenceNum, packet.Payload, timeout); err != nil {
+		if err := c.sendStreamProtocolOneWay(packetType, stream.ID, packet.SequenceNum, packet.Payload, timeout); err != nil {
 			time.Sleep(25 * time.Millisecond)
 			continue
 		}
 		if packet.Payload != nil {
 			arq.FreePayload(packet.Payload)
 		}
-		if streamFinished(stream) {
+		if stream.ID != 0 && streamFinished(stream) {
 			c.deleteStream(stream.ID)
 			return
 		}
@@ -494,6 +480,9 @@ func notifyStreamWake(stream *clientStream) {
 }
 
 func (c *Client) runLocalStreamReadLoop(stream *clientStream, timeout time.Duration) {
+	if stream == nil || stream.ID == 0 {
+		return
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if c.log != nil {
@@ -566,6 +555,9 @@ func streamFinished(stream *clientStream) bool {
 		return true
 	}
 	if stream.ResetSent {
+		return false
+	}
+	if stream == nil || stream.ID == 0 {
 		return false
 	}
 	if !stream.LocalFinSent || !stream.RemoteFinRecv {

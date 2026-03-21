@@ -69,7 +69,7 @@ func (c *Client) applyClientACKState(packet VpnProto.Packet) {
 		return
 	}
 	switch packet.PacketType {
-	case Enums.PACKET_STREAM_DATA_ACK, Enums.PACKET_STREAM_FIN_ACK, Enums.PACKET_STREAM_RST_ACK:
+	case Enums.PACKET_STREAM_DATA_ACK, Enums.PACKET_STREAM_FIN_ACK, Enums.PACKET_STREAM_RST_ACK, Enums.PACKET_DNS_QUERY_REQ_ACK:
 		c.noteStreamProgress(packet.StreamID)
 		if stream, ok := c.getStream(packet.StreamID); ok {
 			if packet.PacketType == Enums.PACKET_STREAM_FIN_ACK {
@@ -82,7 +82,7 @@ func (c *Client) applyClientACKState(packet VpnProto.Packet) {
 			if packet.PacketType == Enums.PACKET_STREAM_FIN_ACK && streamFinished(stream) {
 				c.deleteStream(stream.ID)
 			}
-			if packet.PacketType == Enums.PACKET_STREAM_RST_ACK {
+			if packet.PacketType == Enums.PACKET_STREAM_RST_ACK && stream.ID != 0 {
 				stream.mu.Lock()
 				stream.Closed = true
 				stream.mu.Unlock()
@@ -127,9 +127,7 @@ func (c *Client) dispatchServerPacket(packet VpnProto.Packet, timeout time.Durat
 		result.ackedQueued = result.ackedQueued || acked
 		return result, err
 	case Enums.PACKET_DNS_QUERY_REQ_ACK:
-		if c.stream0Runtime != nil {
-			c.stream0Runtime.ackDNSRequestFragment(packet)
-		}
+		c.applyClientACKState(packet)
 		return result, nil
 	case Enums.PACKET_DNS_QUERY_RES:
 		return result, c.handleInboundDNSResponseFragment(packet)

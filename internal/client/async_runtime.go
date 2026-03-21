@@ -56,7 +56,13 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	c.log.Infof("\U0001F4E1 <cyan>Async Runtime Initialized: <green>%d Writes</green>, <green>%d Reads</green>, <green>%d Processors</green></cyan>",
 		c.tunnelWriterWorkers, c.tunnelReaderWorkers, c.tunnelProcessWorkers)
 
-	// 4. Spawn Reader Workers (High-speed ingestion)
+	// 4. Initialize Virtual Stream 0 (Control Channel)
+	c.initVirtualStream0()
+
+	// 5. Start support runtimes (DNS Cache, Health Monitor)
+	c.StartSupportRuntimes(runtimeCtx)
+
+	// 6. Spawn Reader Workers (High-speed ingestion)
 	for i := 0; i < c.tunnelReaderWorkers; i++ {
 		c.asyncWG.Add(1)
 		go c.asyncReaderWorker(runtimeCtx, i, conn)

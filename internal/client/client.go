@@ -76,7 +76,6 @@ type Client struct {
 	exchangeQueryFn                       func(Connection, []byte, time.Duration) ([]byte, error)
 	sendOneWayPacketFn                    func(Connection, []byte, time.Time) error
 	fragmentLimits                        sync.Map
-	stream0Runtime                        *stream0Runtime
 	streamsMu                             sync.RWMutex
 	streams                               map[uint16]*clientStream
 	closedStreams                         map[uint16]int64
@@ -367,7 +366,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 	c.uploadCompression = uint8(cfg.UploadCompressionType)
 	c.downloadCompression = uint8(cfg.DownloadCompressionType)
 	c.maxPackedBlocks = 1
-	c.stream0Runtime = newStream0Runtime(c)
+	c.initVirtualStream0()
 	return c
 }
 
@@ -454,9 +453,6 @@ func (c *Client) ResetRuntimeState(resetSessionCookie bool) {
 	if c.localDNSCache != nil {
 		c.localDNSCache.ClearPending()
 	}
-	if c.stream0Runtime != nil {
-		c.stream0Runtime.ResetForReconnect()
-	}
 	c.closeAllStreams()
 	c.streamsMu.Lock()
 	c.streams = make(map[uint16]*clientStream, 16)
@@ -501,9 +497,6 @@ func (c *Client) updateMaxPackedBlocks() {
 		c.syncedUploadMTU,
 		c.cfg.MaxPacketsPerBatch,
 	)
-	if c.stream0Runtime != nil {
-		c.stream0Runtime.SetMaxPackedBlocks(c.maxPackedBlocks)
-	}
 }
 
 func (c *Client) applySyncedMTUState(uploadMTU int, downloadMTU int, uploadChars int) {
@@ -736,16 +729,23 @@ func (c *Client) closeAllStreams() {
 		return
 	}
 	c.streamsMu.Lock()
-	streams := c.streams
+	oldStreams := c.streams
 	c.streams = make(map[uint16]*clientStream, 16)
 	c.closedStreams = make(map[uint16]int64, 16)
 	c.streamsMu.Unlock()
+
 	c.clearAllStreamControlTracking()
 	if c.streamDataFragments != nil {
 		c.streamDataFragments = fragmentStore.New[clientStreamDataFragmentKey](64)
 	}
-	for _, stream := range streams {
-		if stream == nil {
+
+	for id, stream := range oldStreams {
+		if stream == nil || id == 0 {
+			if id == 0 && stream != nil {
+				c.streamsMu.Lock()
+				c.streams[0] = stream
+				c.streamsMu.Unlock()
+			}
 			continue
 		}
 		stream.stopOnce.Do(func() {
@@ -1016,4 +1016,56 @@ func (c *Client) startResolverHealthRuntime(ctx context.Context) {
 	c.resolverHealthMu.Unlock()
 
 	go c.runResolverHealthLoop(ctx)
+}
+
+func (c *Client) initVirtualStream0() {
+	if c == nil {
+		return
+	}
+
+	c.streamsMu.Lock()
+	defer c.streamsMu.Unlock()
+
+	// Recreate or reset - ensure old one is stopped if it existed
+	if old, exists := c.streams[0]; exists && old.StopCh != nil {
+		select {
+		case <-old.StopCh:
+		default:
+			close(old.StopCh)
+		}
+	}
+
+	s := &clientStream{
+		ID:             0,
+		LastActivityAt: time.Now(),
+		StopCh:         make(chan struct{}),
+		TXWake:         make(chan struct{}, 1),
+		TXQueue:        make([]clientStreamTXPacket, 0, 16),
+		InboundPending: make(map[uint16][]byte),
+		arqWindowSize:  c.arqWindowSize,
+		log:            c.log,
+	}
+
+	c.streams[0] = s
+	c.log.Debugf("\U0001F310 <cyan>Virtual Stream 0 (Control Channel) Reset & Initialized.</cyan>")
+	go c.runClientStreamTXLoop(s, 5*time.Second)
+}
+
+func (c *Client) QueueControlPacket(packetType uint8, payload []byte) {
+	if c == nil {
+		return
+	}
+	s, ok := c.getStream(0)
+	if !ok {
+		return
+	}
+	_ = c.queueStreamPacket(s, packetType, payload)
+}
+
+func (c *Client) StartSupportRuntimes(ctx context.Context) {
+	if c == nil {
+		return
+	}
+	c.ensureLocalDNSCachePersistence(ctx)
+	c.startResolverHealthRuntime(ctx)
 }

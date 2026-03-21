@@ -26,10 +26,6 @@ func (c *Client) RunLocalDNSListener(ctx context.Context) error {
 		return nil
 	}
 
-	if err := c.startStream0Runtime(ctx); err != nil {
-		return err
-	}
-
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{
 		IP:   net.ParseIP(c.cfg.LocalDNSIP),
 		Port: c.cfg.LocalDNSPort,
@@ -100,17 +96,6 @@ func (c *Client) RunLocalDNSListener(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) startStream0Runtime(ctx context.Context) error {
-	if c == nil || c.stream0Runtime == nil {
-		return nil
-	}
-	c.ensureLocalDNSCachePersistence(ctx)
-	if err := c.stream0Runtime.Start(ctx); err != nil {
-		return err
-	}
-	c.startResolverHealthRuntime(ctx)
-	return nil
-}
 
 func (c *Client) localDNSWorker(ctx context.Context, conn *net.UDPConn, queue <-chan localDNSRequest, packetPool *sync.Pool) {
 	for {
