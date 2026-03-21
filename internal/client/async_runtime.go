@@ -43,6 +43,14 @@ func (c *Client) StopAsyncRuntime() {
 		c.log.Debugf("\U0001F232 <green>Async Runtime stopped cleanly.</green>")
 	}
 
+	if c.tcpListener != nil {
+		c.tcpListener.Stop()
+	}
+
+	if c.dnsListener != nil {
+		c.dnsListener.Stop()
+	}
+
 	if c.tunnelConn != nil {
 		_ = c.tunnelConn.Close()
 		c.tunnelConn = nil
@@ -79,6 +87,22 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 
 	// 5. Start support runtimes (DNS Cache, Health Monitor)
 	// c.StartSupportRuntimes(runtimeCtx)
+
+	// Start TCP/SOCKS Proxy Listener
+	c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
+	if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
+		c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
+		return err
+	}
+
+	// Start DNS Listener if enabled
+	if c.cfg.LocalDNSEnabled {
+		c.dnsListener = NewDNSListener(c)
+		if err := c.dnsListener.Start(runtimeCtx, c.cfg.LocalDNSIP, c.cfg.LocalDNSPort); err != nil {
+			c.log.Errorf("<red>❌ Failed to start DNS resolver: %v</red>", err)
+			return err
+		}
+	}
 
 	// 6. Spawn Reader Workers (High-speed ingestion)
 	for i := 0; i < c.tunnelReaderWorkers; i++ {

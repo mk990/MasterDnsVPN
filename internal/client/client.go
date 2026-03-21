@@ -90,6 +90,10 @@ type Client struct {
 	tunnelWriterWorkers  int
 	tunnelProcessWorkers int
 	tunnelPacketTimeout  time.Duration
+
+	// Local Proxy Daemons
+	tcpListener *TCPListener
+	dnsListener *DNSListener
 }
 
 // Connection represents a unique domain-resolver pair with its associated metadata and MTU states.
