@@ -99,6 +99,9 @@ type Client struct {
 	streamsMu      sync.RWMutex
 	active_streams map[uint16]*Stream_client
 	last_stream_id uint16
+
+	// Signal to wake up dispatcher
+	txSignal chan struct{}
 }
 
 // clientStreamTXPacket represents a queued packet pending transmission or retransmission.
@@ -197,6 +200,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		txChannel:            make(chan asyncPacket, 1024),
 		rxChannel:            make(chan asyncReadPacket, 1024),
 		active_streams:       make(map[uint16]*Stream_client),
+		txSignal:             make(chan struct{}, 1),
 	}
 }
 

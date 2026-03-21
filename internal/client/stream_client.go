@@ -26,6 +26,8 @@ var txPacketPool = sync.Pool{
 // Stream_client represents a single stream's data structure, mirroring the Python version's
 // 'active_streams' dictionary elements.
 type Stream_client struct {
+	client *Client
+
 	StreamID           uint16
 	NetConn            net.Conn
 	CreateTime         time.Time
@@ -99,6 +101,7 @@ func (c *Client) new_stream(streamID uint16, conn net.Conn, targetPayload []byte
 	now := time.Now()
 
 	s := &Stream_client{
+		client:             c,
 		StreamID:           streamID,
 		NetConn:            conn,
 		CreateTime:         now,
@@ -175,6 +178,11 @@ func (s *Stream_client) PushTXPacket(priority int, packetType uint8, sequenceNum
 		// Duplicate found in census
 		s.ReleaseTXPacket(p)
 		return false
+	}
+
+	select {
+	case s.client.txSignal <- struct{}{}:
+	default:
 	}
 
 	return true

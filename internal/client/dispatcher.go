@@ -50,6 +50,43 @@ func appendPackedControlBlockFromClient(dst []byte, p *clientStreamTXPacket, str
 	)
 }
 
+// selectTargetConnections determines how many redundant packets should be sent and which connections to use.
+func (c *Client) selectTargetConnections(packetType uint8, streamID uint16) []Connection {
+	targetCount := c.cfg.PacketDuplicationCount
+	if targetCount < 1 {
+		targetCount = 1
+	}
+
+	// SYN packets often use higher duplication for reliability during handshake
+	if packetType == Enums.PACKET_STREAM_SYN || packetType == Enums.PACKET_SOCKS5_SYN {
+		if c.cfg.SetupPacketDuplicationCount > targetCount {
+			targetCount = c.cfg.SetupPacketDuplicationCount
+		}
+	}
+
+	// If duplication is disabled, just return the best connection (preferred if possible)
+	if targetCount <= 1 {
+		if streamID > 0 {
+			c.streamsMu.RLock()
+			s := c.active_streams[streamID]
+			c.streamsMu.RUnlock()
+			if s != nil && s.PreferredServerKey != "" {
+				if idx, ok := c.connectionsByKey[s.PreferredServerKey]; ok {
+					return []Connection{c.connections[idx]}
+				}
+			}
+		}
+		best, ok := c.balancer.GetBestConnection()
+		if ok {
+			return []Connection{best}
+		}
+		return nil
+	}
+
+	// For multiple packets, use unique connections from balancer
+	return c.balancer.GetUniqueConnections(targetCount)
+}
+
 // asyncStreamDispatcher cycles through all active streams using a fair Round-Robin algorithm
 // and transmits the highest priority packets to the TX workers, packing control blocks when possible.
 func (c *Client) asyncStreamDispatcher(ctx context.Context) {
@@ -57,23 +94,20 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 	defer c.asyncWG.Done()
 
 	var rrCursor uint16 = 0
-	maxBlocks := c.maxPackedBlocks
-	if maxBlocks <= 0 {
-		maxBlocks = 1 // Default fallback if missing
-	}
 
 	for {
+		// Wait for signal or timeout
 		select {
 		case <-ctx.Done():
 			return
-		default:
+		case <-c.txSignal:
+		case <-time.After(20 * time.Millisecond):
 		}
 
 		c.streamsMu.RLock()
 		streamCount := len(c.active_streams)
 		if streamCount == 0 {
 			c.streamsMu.RUnlock()
-			time.Sleep(2 * time.Millisecond) // Slight cool-down when totally empty
 			continue
 		}
 
@@ -102,7 +136,6 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 		}
 
 		if highestPrio == -1 {
-			time.Sleep(2 * time.Millisecond) // Idle
 			continue
 		}
 
@@ -115,6 +148,10 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 			if s != nil && s.txQueue != nil && s.txQueue.HighestPriority() == highestPrio {
 				candidates = append(candidates, s)
 			}
+		}
+
+		if len(candidates) == 0 {
+			continue
 		}
 
 		// Fair Round-Robin Pick
@@ -137,10 +174,13 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 		}
 
 		var finalPacket asyncPacket
-		isPackable := isPackableControlPacket(item.PacketType)
 		wasPacked := false
+		maxBlocks := c.maxPackedBlocks
+		if maxBlocks < 1 {
+			maxBlocks = 1
+		}
 
-		if isPackable && maxBlocks > 1 && len(candidates) > 0 {
+		if isPackableControlPacket(item.PacketType) && maxBlocks > 1 {
 			payload := make([]byte, 0, maxBlocks*PackedControlBlockSize)
 			payload = appendPackedControlBlockFromClient(payload, item, selected.StreamID)
 			blocks := 1
@@ -167,11 +207,11 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 					if sid == selected.StreamID {
 						continue
 					}
-					
+
 					c.streamsMu.RLock()
 					otherStream := c.active_streams[sid]
 					c.streamsMu.RUnlock()
-					
+
 					if otherStream == nil || otherStream.txQueue == nil {
 						continue
 					}
@@ -194,7 +234,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 				finalPacket = asyncPacket{
 					packetType: Enums.PACKET_PACKED_CONTROL_BLOCKS,
 					payload:    payload,
-				} // No Stream ID context tied globally to the UDP socket envelope
+				}
 				selected.ReleaseTXPacket(item)
 				wasPacked = true
 			} else {
@@ -211,32 +251,36 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 			}
 		}
 
-		// Routing / Balancing Policy
-		var routingConn *Connection
-
-		if selected.StreamID != 0 && selected.PreferredServerKey != "" {
-			if conn, ok := c.connectionsByKey[selected.PreferredServerKey]; ok {
-				if conn >= 0 && conn < len(c.connections) {
-					routingConn = &c.connections[conn]
-				}
+		// Packet Duplication Logic
+		conns := c.selectTargetConnections(finalPacket.packetType, selected.StreamID)
+		if len(conns) == 0 {
+			if !wasPacked {
+				selected.ReleaseTXPacket(item)
 			}
-		}
-		
-		if routingConn == nil {
-			c2, ok := c.balancer.GetBestConnection()
-			if ok {
-				routingConn = &c2
-			}
+			continue
 		}
 
-		if routingConn != nil {
-			finalPacket.conn = *routingConn
-			c.txChannel <- finalPacket
+		for _, conn := range conns {
+			pkt := finalPacket
+			pkt.conn = conn
+
+			// Send to TX channel
+			select {
+			case c.txChannel <- pkt:
+			default:
+				// Channel full, drop or wait? Python TX worker might be slow.
+				// In Go, we'll try to push to avoid blocking the dispatcher too much.
+			}
 		}
 
 		if !wasPacked {
-			// Memory cleanup (the struct slice pointer is natively copied above, item safely returns)
 			selected.ReleaseTXPacket(item)
+		}
+
+		// Loop quickly if there's more potential work
+		select {
+		case c.txSignal <- struct{}{}:
+		default:
 		}
 	}
 }
