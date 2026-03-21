@@ -175,16 +175,31 @@ func (c *Client) exchangeStreamControlPacket(packetType uint8, streamID uint16, 
 	}
 	timeout = normalizeTimeout(timeout, defaultRuntimeTimeout)
 	deadline := time.Now().Add(timeout)
-	retryDelay := streamControlRetryBaseDelay
 	lastErr := error(ErrStreamHandshakeFailed)
+	defer c.clearStreamControlState(packetType, streamID, sequenceNum)
 
-	for attempt := 1; ; attempt++ {
+	for {
 		if cachedPacket, ok := c.takeExpectedStreamControlReply(packetType, streamID, sequenceNum); ok {
 			return cachedPacket, nil
 		}
+		now := time.Now()
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return VpnProto.Packet{}, lastErr
+		}
+		state := c.getOrCreateStreamControlState(packetType, streamID, sequenceNum, now)
+		if state.retryAt.After(now) {
+			packet, ok, waitErr := c.awaitExpectedStreamControlReply(packetType, streamID, sequenceNum, deadline)
+			if waitErr == nil && ok {
+				return packet, nil
+			}
+			if waitErr != nil {
+				lastErr = waitErr
+			}
+			if !shouldRetryStreamControlPacket(packetType) {
+				return VpnProto.Packet{}, lastErr
+			}
+			continue
 		}
 
 		connections, err := c.selectTargetConnectionsForPacket(packetType, streamID)
@@ -199,13 +214,14 @@ func (c *Client) exchangeStreamControlPacket(packetType uint8, streamID uint16, 
 			}
 			lastErr = err
 		} else {
+			state = c.noteStreamControlSend(packetType, streamID, sequenceNum, now)
 			if c.log != nil {
 				c.log.Debugf(
 					"🧦 <blue>Sending Stream Control Packet, Stream ID: <cyan>%d</cyan> | Packet: <cyan>%s</cyan> | Targets: <cyan>%d</cyan> | Attempt: <cyan>%d</cyan></blue>",
 					streamID,
 					Enums.PacketTypeName(packetType),
 					len(connections),
-					attempt,
+					state.retryCount,
 				)
 			}
 			if err := c.sendStreamControlPacketOneWay(packetType, streamID, sequenceNum, payload, connections, remaining); err == nil {
@@ -225,22 +241,6 @@ func (c *Client) exchangeStreamControlPacket(packetType uint8, streamID uint16, 
 
 		if !shouldRetryStreamControlPacket(packetType) {
 			return VpnProto.Packet{}, lastErr
-		}
-
-		remaining = time.Until(deadline)
-		if remaining <= 0 {
-			return VpnProto.Packet{}, lastErr
-		}
-		sleepFor := retryDelay
-		if sleepFor > remaining {
-			sleepFor = remaining
-		}
-		if sleepFor > 0 {
-			time.Sleep(sleepFor)
-		}
-		retryDelay *= 2
-		if retryDelay > streamControlRetryMaxDelay {
-			retryDelay = streamControlRetryMaxDelay
 		}
 	}
 }
@@ -285,6 +285,12 @@ func (c *Client) awaitExpectedStreamControlReply(sentType uint8, streamID uint16
 			return VpnProto.Packet{}, false, ErrStreamHandshakeFailed
 		}
 		waitFor := streamControlPollInterval
+		if retryAt, ok := c.streamControlRetryAt(sentType, streamID, sequenceNum); ok {
+			retryWait := time.Until(retryAt)
+			if retryWait > 0 && retryWait < waitFor {
+				waitFor = retryWait
+			}
+		}
 		if waitFor > remaining {
 			waitFor = remaining
 		}
@@ -324,7 +330,7 @@ func (c *Client) harvestServerReplies(timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	if c.log != nil {
+	if c.log != nil && packet.PacketType != Enums.PACKET_PONG {
 		c.log.Debugf(
 			"ðŸ§¦ <blue>Stream Control Harvest Reply | Got: <cyan>%s</cyan></blue>",
 			Enums.PacketTypeName(packet.PacketType),

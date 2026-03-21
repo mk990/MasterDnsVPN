@@ -53,6 +53,15 @@ func (s *Server) startStreamUpstreamReadLoop(sessionID uint8, streamID uint16, c
 				if !ok {
 					return
 				}
+				if s.log != nil {
+					s.log.Debugf(
+						"\U0001F4E5 <blue>Upstream Stream Read</blue> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Stream</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Seq</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Bytes</blue>: <cyan>%d</cyan>",
+						sessionID,
+						streamID,
+						sequenceNum,
+						n,
+					)
+				}
 				if !s.queueSessionPacket(sessionID, VpnProto.Packet{
 					PacketType:      Enums.PACKET_STREAM_DATA,
 					StreamID:        streamID,
@@ -76,6 +85,15 @@ func (s *Server) startStreamUpstreamReadLoop(sessionID uint8, streamID uint16, c
 						})
 					}
 					return
+				}
+				if s.log != nil {
+					s.log.Debugf(
+						"\U0001F4E4 <blue>Queued Upstream Stream Data</blue> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Stream</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Seq</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Bytes</blue>: <cyan>%d</cyan>",
+						sessionID,
+						streamID,
+						sequenceNum,
+						n,
+					)
 				}
 			}
 

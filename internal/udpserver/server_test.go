@@ -1093,7 +1093,7 @@ func TestHandlePacketIgnoresDuplicateStreamDataWrite(t *testing.T) {
 		readDone <- nil
 	}()
 
-	dataQuery := buildTunnelStreamQuery(t, codec, "a.com", sessionID, sessionCookie, Enums.PACKET_STREAM_DATA, 12, 9, []byte("hello"))
+	dataQuery := buildTunnelStreamQuery(t, codec, "a.com", sessionID, sessionCookie, Enums.PACKET_STREAM_DATA, 12, 2, []byte("hello"))
 	_ = srv.handlePacket(dataQuery)
 	_ = srv.handlePacket(dataQuery)
 
@@ -1104,6 +1104,149 @@ func TestHandlePacketIgnoresDuplicateStreamDataWrite(t *testing.T) {
 	}
 	if second != nil {
 		t.Fatalf("duplicate stream data must not be written again: %q", second)
+	}
+}
+
+func TestHandlePacketReordersOutOfOrderStreamDataBeforeUpstreamWrite(t *testing.T) {
+	codec, err := security.NewCodec(0, "")
+	if err != nil {
+		t.Fatalf("NewCodec returned error: %v", err)
+	}
+
+	srv := New(config.ServerConfig{
+		MaxPacketSize:     65535,
+		Domain:            []string{"a.com"},
+		MinVPNLabelLength: 3,
+	}, nil, codec)
+
+	initPayload := []byte{0, 0x00, 0x00, 0x96, 0x00, 0xC8, 0x10, 0x20, 0x30, 0x40}
+	initResponse := srv.handlePacket(buildTunnelQueryWithSessionID(t, codec, "a.com", 0, Enums.PACKET_SESSION_INIT, initPayload))
+	packet, err := DnsParser.ExtractVPNResponse(initResponse, false)
+	if err != nil {
+		t.Fatalf("ExtractVPNResponse returned error: %v", err)
+	}
+	sessionID := packet.Payload[0]
+	sessionCookie := packet.Payload[1]
+
+	synQuery := buildTunnelStreamQuery(t, codec, "a.com", sessionID, sessionCookie, Enums.PACKET_STREAM_SYN, 14, 1, nil)
+	_ = srv.handlePacket(synQuery)
+
+	upstreamConn, peerConn := net.Pipe()
+	defer upstreamConn.Close()
+	defer peerConn.Close()
+	if _, ok := srv.streams.AttachUpstream(sessionID, 14, "127.0.0.1", 80, upstreamConn, time.Now()); !ok {
+		t.Fatal("AttachUpstream returned false")
+	}
+
+	readDone := make(chan []byte, 1)
+	go func() {
+		buffer := make([]byte, 16)
+		n, _ := io.ReadFull(peerConn, buffer[:10])
+		readDone <- append([]byte(nil), buffer[:n]...)
+	}()
+
+	outOfOrder := buildTunnelStreamQuery(t, codec, "a.com", sessionID, sessionCookie, Enums.PACKET_STREAM_DATA, 14, 3, []byte("world"))
+	inOrder := buildTunnelStreamQuery(t, codec, "a.com", sessionID, sessionCookie, Enums.PACKET_STREAM_DATA, 14, 2, []byte("hello"))
+
+	firstResp := srv.handlePacket(outOfOrder)
+	firstPacket, err := DnsParser.ExtractVPNResponse(firstResp, false)
+	if err != nil {
+		t.Fatalf("ExtractVPNResponse returned error for out-of-order packet: %v", err)
+	}
+	if firstPacket.PacketType != Enums.PACKET_STREAM_DATA_ACK || firstPacket.SequenceNum != 3 {
+		t.Fatalf("unexpected first ack packet: %+v", firstPacket)
+	}
+
+	secondResp := srv.handlePacket(inOrder)
+	secondPacket, err := DnsParser.ExtractVPNResponse(secondResp, false)
+	if err != nil {
+		t.Fatalf("ExtractVPNResponse returned error for in-order packet: %v", err)
+	}
+	if secondPacket.PacketType != Enums.PACKET_STREAM_DATA_ACK || secondPacket.SequenceNum != 2 {
+		t.Fatalf("unexpected second ack packet: %+v", secondPacket)
+	}
+
+	select {
+	case payload := <-readDone:
+		if string(payload) != "helloworld" {
+			t.Fatalf("unexpected reordered upstream payload: %q", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for reordered upstream payload")
+	}
+}
+
+func TestHandlePacketAssemblesFragmentedStreamDataBeforeUpstreamWrite(t *testing.T) {
+	codec, err := security.NewCodec(0, "")
+	if err != nil {
+		t.Fatalf("NewCodec returned error: %v", err)
+	}
+
+	srv := New(config.ServerConfig{
+		MaxPacketSize:     65535,
+		Domain:            []string{"a.com"},
+		MinVPNLabelLength: 3,
+	}, nil, codec)
+
+	initPayload := []byte{0, 0x00, 0x00, 0x96, 0x00, 0xC8, 0x10, 0x20, 0x30, 0x40}
+	initResponse := srv.handlePacket(buildTunnelQueryWithSessionID(t, codec, "a.com", 0, Enums.PACKET_SESSION_INIT, initPayload))
+	packet, err := DnsParser.ExtractVPNResponse(initResponse, false)
+	if err != nil {
+		t.Fatalf("ExtractVPNResponse returned error: %v", err)
+	}
+	sessionID := packet.Payload[0]
+	sessionCookie := packet.Payload[1]
+
+	synQuery := buildTunnelStreamQuery(t, codec, "a.com", sessionID, sessionCookie, Enums.PACKET_STREAM_SYN, 15, 1, nil)
+	_ = srv.handlePacket(synQuery)
+
+	upstreamConn, peerConn := net.Pipe()
+	defer upstreamConn.Close()
+	defer peerConn.Close()
+	if _, ok := srv.streams.AttachUpstream(sessionID, 15, "127.0.0.1", 80, upstreamConn, time.Now()); !ok {
+		t.Fatal("AttachUpstream returned false")
+	}
+
+	readDone := make(chan []byte, 1)
+	go func() {
+		buffer := make([]byte, 8)
+		n, _ := io.ReadFull(peerConn, buffer[:5])
+		readDone <- append([]byte(nil), buffer[:n]...)
+	}()
+
+	fragment1 := buildTunnelStreamQueryFragment(t, codec, "a.com", sessionID, sessionCookie, Enums.PACKET_STREAM_DATA, 15, 2, 1, 2, []byte("lo"))
+	response1 := srv.handlePacket(fragment1)
+	packet1, err := DnsParser.ExtractVPNResponse(response1, false)
+	if err != nil {
+		t.Fatalf("ExtractVPNResponse returned error for first fragment: %v", err)
+	}
+	if packet1.PacketType != Enums.PACKET_PONG {
+		t.Fatalf("expected first fragment to stay unacked until assembly completes, got=%d", packet1.PacketType)
+	}
+
+	select {
+	case <-readDone:
+		t.Fatal("fragmented stream data must not be written before assembly")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	fragment0 := buildTunnelStreamQueryFragment(t, codec, "a.com", sessionID, sessionCookie, Enums.PACKET_STREAM_DATA, 15, 2, 0, 2, []byte("hel"))
+	response2 := srv.handlePacket(fragment0)
+	packet2, err := DnsParser.ExtractVPNResponse(response2, false)
+	if err != nil {
+		t.Fatalf("ExtractVPNResponse returned error for second fragment: %v", err)
+	}
+	if packet2.PacketType != Enums.PACKET_STREAM_DATA_ACK || packet2.SequenceNum != 2 {
+		t.Fatalf("unexpected ack packet after assembly: %+v", packet2)
+	}
+
+	select {
+	case payload := <-readDone:
+		if string(payload) != "hello" {
+			t.Fatalf("unexpected assembled upstream payload: %q", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for assembled upstream payload")
 	}
 }
 

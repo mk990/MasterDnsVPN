@@ -58,6 +58,17 @@ func (c *Client) handleInboundDNSResponseFragment(packet VpnProto.Packet) error 
 	}
 
 	if c.stream0Runtime != nil {
+		if c.stream0Runtime.completeDNSRequest(packet.SequenceNum) && c.log != nil {
+			c.log.Debugf(
+				"\U0001F9E9 <blue>Resolved Tunnel DNS Request, Seq: <cyan>%d</cyan> | Fragment: <cyan>%d/%d</cyan></blue>",
+				packet.SequenceNum,
+				packet.FragmentID+1,
+				max(1, int(packet.TotalFragments)),
+			)
+		}
+	}
+
+	if c.stream0Runtime != nil {
 		c.stream0Runtime.QueueMainPacket(arqQueuedDNSAck(packet))
 	}
 

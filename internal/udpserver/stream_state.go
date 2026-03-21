@@ -20,6 +20,7 @@ import (
 const (
 	serverClosedStreamRecordTTL = 45 * time.Second
 	serverClosedStreamRecordCap = 1000
+	serverInboundReorderWindow  = 64
 )
 
 type streamStateRecord struct {
@@ -34,10 +35,16 @@ type streamStateRecord struct {
 	LastActivityAt time.Time
 	LastSequence   uint16
 	OutboundSeq    uint16
-	InboundDataSeq uint16
-	InboundDataSet bool
+	InboundNextSeq uint16
+	InboundNextSet bool
+	InboundPending map[uint16][]byte
 	RemoteFinSeq   uint16
 	RemoteFinSet   bool
+}
+
+type inboundDataDecision struct {
+	Ack          bool
+	ReadyPayload [][]byte
 }
 
 type streamStateStore struct {
@@ -152,22 +159,62 @@ func (s *streamStateStore) MarkRemoteFin(sessionID uint8, streamID uint16, seque
 	return cloneStreamStateRecord(record), true
 }
 
-func (s *streamStateStore) ClassifyInboundData(sessionID uint8, streamID uint16, sequenceNum uint16, now time.Time) (*streamStateRecord, bool, bool) {
+func (s *streamStateStore) ReceiveInboundData(sessionID uint8, streamID uint16, sequenceNum uint16, payload []byte, now time.Time) (*streamStateRecord, inboundDataDecision, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	record := s.lookupLocked(sessionID, streamID)
 	if record == nil {
-		return nil, false, false
+		return nil, inboundDataDecision{}, false
 	}
+	prevSequence := record.LastSequence
 	record.LastActivityAt = now
 	record.LastSequence = sequenceNum
-	if record.InboundDataSet && streamutil.SequenceSeenOrOlder(record.InboundDataSeq, sequenceNum) {
-		return cloneStreamStateRecord(record), true, false
+
+	if !record.InboundNextSet {
+		nextSeq := prevSequence + 1
+		if nextSeq == 0 {
+			nextSeq = 1
+		}
+		record.InboundNextSeq = nextSeq
+		record.InboundNextSet = true
 	}
-	record.InboundDataSeq = sequenceNum
-	record.InboundDataSet = true
-	return cloneStreamStateRecord(record), true, true
+
+	lastDelivered := record.InboundNextSeq - 1
+	if record.InboundNextSeq == 0 {
+		lastDelivered = 0xFFFF
+	}
+	if streamutil.SequenceSeenOrOlder(lastDelivered, sequenceNum) {
+		return cloneStreamStateRecord(record), inboundDataDecision{Ack: true}, true
+	}
+
+	diff := uint16(sequenceNum - record.InboundNextSeq)
+	if diff > serverInboundReorderWindow {
+		return cloneStreamStateRecord(record), inboundDataDecision{}, true
+	}
+
+	if record.InboundPending == nil {
+		record.InboundPending = make(map[uint16][]byte, 8)
+	}
+	if _, exists := record.InboundPending[sequenceNum]; !exists {
+		record.InboundPending[sequenceNum] = append([]byte(nil), payload...)
+	}
+
+	decision := inboundDataDecision{Ack: true}
+	for {
+		chunk, ok := record.InboundPending[record.InboundNextSeq]
+		if !ok {
+			break
+		}
+		decision.ReadyPayload = append(decision.ReadyPayload, chunk)
+		delete(record.InboundPending, record.InboundNextSeq)
+		record.InboundNextSeq++
+		if record.InboundNextSeq == 0 {
+			record.InboundNextSeq = 1
+		}
+	}
+
+	return cloneStreamStateRecord(record), decision, true
 }
 
 func (s *streamStateStore) IsDuplicateRemoteFin(sessionID uint8, streamID uint16, sequenceNum uint16, now time.Time) (*streamStateRecord, bool, bool) {
@@ -412,5 +459,6 @@ func cloneStreamStateRecord(record *streamStateRecord) *streamStateRecord {
 		return nil
 	}
 	cloned := *record
+	cloned.InboundPending = nil
 	return &cloned
 }

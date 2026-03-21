@@ -23,6 +23,7 @@ const maxClientStreamFollowUps = 16
 const streamTXInitialRetryDelay = 350 * time.Millisecond
 const streamTXMaxRetryDelay = 2 * time.Second
 const streamTXMinRetryDelay = 120 * time.Millisecond
+const clientInboundReorderWindow = 64
 
 var ErrClientStreamClosed = errors.New("client stream closed")
 var ErrClientStreamBackpressure = errors.New("client stream send queue full")
@@ -227,16 +228,44 @@ func (c *Client) handleInboundStreamPacket(packet VpnProto.Packet, timeout time.
 			)
 		}
 		c.noteStreamProgress(stream.ID)
+		assembled, ready, completed := c.collectInboundStreamDataFragments(packet)
+		if completed {
+			return c.sendStreamAckOneWay(Enums.PACKET_STREAM_DATA_ACK, stream.ID, packet.SequenceNum)
+		}
+		if !ready {
+			return VpnProto.Packet{}, nil
+		}
 		stream.mu.Lock()
-		if stream.InboundDataSet && streamutil.SequenceSeenOrOlder(stream.InboundDataSeq, packet.SequenceNum) {
+		if !stream.InboundNextSet {
+			stream.InboundNextSeq = 1
+			stream.InboundNextSet = true
+		}
+		lastDelivered := stream.InboundNextSeq - 1
+		if stream.InboundNextSeq == 0 {
+			lastDelivered = 0xFFFF
+		}
+		if stream.InboundDataSet && streamutil.SequenceSeenOrOlder(lastDelivered, packet.SequenceNum) {
 			stream.mu.Unlock()
 			return c.sendStreamAckOneWay(Enums.PACKET_STREAM_DATA_ACK, stream.ID, packet.SequenceNum)
 		}
-		stream.InboundDataSeq = packet.SequenceNum
-		stream.InboundDataSet = true
+		diff := uint16(packet.SequenceNum - stream.InboundNextSeq)
+		if diff > clientInboundReorderWindow {
+			stream.mu.Unlock()
+			return VpnProto.Packet{}, nil
+		}
+		if stream.InboundPending == nil {
+			stream.InboundPending = make(map[uint16][]byte, 8)
+		}
+		if _, exists := stream.InboundPending[packet.SequenceNum]; !exists {
+			stream.InboundPending[packet.SequenceNum] = assembled
+		}
+		readyPayloads := drainClientInboundReadyChunks(stream)
 		stream.mu.Unlock()
-		if len(packet.Payload) != 0 {
-			if _, err := stream.Conn.Write(packet.Payload); err != nil {
+		for _, readyPayload := range readyPayloads {
+			if len(readyPayload) == 0 {
+				continue
+			}
+			if _, err := stream.Conn.Write(readyPayload); err != nil {
 				stream.mu.Lock()
 				stream.Closed = true
 				stream.mu.Unlock()

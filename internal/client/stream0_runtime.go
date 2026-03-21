@@ -368,9 +368,11 @@ func (r *stream0Runtime) nextPingSchedule(now time.Time) (bool, time.Duration) {
 	hasPendingDNS := r.client != nil && r.client.hasPendingDNSWork()
 	activeStreams := 0
 	hasStreamTXWork := false
+	hasControlWork := false
 	if r.client != nil {
 		activeStreams = r.client.activeStreamCount()
 		hasStreamTXWork = r.client.hasActiveStreamTXWork()
+		hasControlWork = r.client.hasPendingStreamControlWork()
 	}
 
 	lastPingTime := time.Unix(0, r.lastPingTime.Load())
@@ -383,10 +385,13 @@ func (r *stream0Runtime) nextPingSchedule(now time.Time) (bool, time.Duration) {
 	maxSleep := time.Second
 
 	// Context-aware interval optimization
-	if activeStreams > 0 {
+	if activeStreams > 0 || hasControlWork {
 		if hasStreamTXWork {
 			pingInterval = 80 * time.Millisecond
 			maxSleep = 50 * time.Millisecond
+		} else if hasControlWork {
+			pingInterval = 100 * time.Millisecond
+			maxSleep = 60 * time.Millisecond
 		} else if !r.dnsActivitySeen.Load() {
 			// Session is active but no DNS traffic yet, ping slowly but consistently
 			pingInterval = 2 * time.Second
@@ -435,7 +440,7 @@ func (r *stream0Runtime) nextPingSchedule(now time.Time) (bool, time.Duration) {
 func (r *stream0Runtime) processDequeue(packet arq.QueuedPacket) {
 	defer arq.FreePayload(packet.Payload)
 
-	if r.client != nil && r.client.exchangeQueryFn == nil && packet.PacketType != Enums.PACKET_PING {
+	if packet.PacketType != Enums.PACKET_PING {
 		sentAt := time.Now()
 		if r.client.log != nil {
 			r.client.log.Debugf(
@@ -572,6 +577,21 @@ func (r *stream0Runtime) ackDNSRequestFragment(packet VpnProto.Packet) bool {
 	if len(state.fragments) == 0 {
 		delete(r.dnsRequests, packet.SequenceNum)
 	}
+	return true
+}
+
+func (r *stream0Runtime) completeDNSRequest(sequenceNum uint16) bool {
+	if r == nil || sequenceNum == 0 {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.dnsRequests[sequenceNum]; !ok {
+		return false
+	}
+	delete(r.dnsRequests, sequenceNum)
 	return true
 }
 

@@ -39,6 +39,7 @@ type Client struct {
 	connectionsByKey       map[string]int
 	localDNSCache          *dnsCache.Store
 	dnsResponses           *fragmentStore.Store[clientDNSFragmentKey]
+	streamDataFragments    *fragmentStore.Store[clientStreamDataFragmentKey]
 	localDNSCachePath      string
 	localDNSCachePersist   bool
 	localDNSCacheFlushTick time.Duration
@@ -98,6 +99,8 @@ type Client struct {
 	recheckConnectionFn                   func(*Connection) bool
 	streamControlReplyMu                  sync.Mutex
 	streamControlReplies                  map[streamControlReplyKey]cachedStreamControlReply
+	streamControlStateMu                  sync.Mutex
+	streamControlStates                   map[streamControlStateKey]clientStreamControlState
 
 	sessionResetSignal  chan struct{}
 	sessionResetPending atomic.Bool
@@ -145,6 +148,9 @@ type clientStream struct {
 	LastActivityAt       time.Time
 	InboundDataSeq       uint16
 	InboundDataSet       bool
+	InboundNextSeq       uint16
+	InboundNextSet       bool
+	InboundPending       map[uint16][]byte
 	RemoteFinSeq         uint16
 	RemoteFinSet         bool
 	PreferredServerKey   string
@@ -181,6 +187,25 @@ type streamControlReplyKey struct {
 type cachedStreamControlReply struct {
 	packet   VpnProto.Packet
 	storedAt time.Time
+}
+
+type streamControlStateKey struct {
+	streamID    uint16
+	sequenceNum uint16
+	packetType  uint8
+}
+
+type clientStreamControlState struct {
+	createdAt  time.Time
+	lastSentAt time.Time
+	retryAt    time.Time
+	retryDelay time.Duration
+	retryCount int
+}
+
+type clientStreamDataFragmentKey struct {
+	streamID    uint16
+	sequenceNum uint16
 }
 
 func Bootstrap(configPath string) (*Client, error) {
@@ -224,6 +249,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 			time.Duration(cfg.LocalDNSPendingTimeoutSec*float64(time.Second)),
 		),
 		dnsResponses:         fragmentStore.New[clientDNSFragmentKey](32),
+		streamDataFragments:  fragmentStore.New[clientStreamDataFragmentKey](64),
 		localDNSCachePath:    cfg.LocalDNSCachePath(),
 		localDNSCachePersist: cfg.LocalDNSCachePersist,
 		localDNSCacheFlushTick: time.Duration(
@@ -258,6 +284,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		resolverRecheck:           make(map[string]resolverRecheckState, len(cfg.Domains)*len(cfg.Resolvers)),
 		runtimeDisabled:           make(map[string]resolverDisabledState, len(cfg.Domains)*len(cfg.Resolvers)),
 		streamControlReplies:      make(map[streamControlReplyKey]cachedStreamControlReply, 16),
+		streamControlStates:       make(map[streamControlStateKey]clientStreamControlState, 8),
 		sessionResetSignal:        make(chan struct{}, 1),
 		resolverConns:             make(map[string]chan *net.UDPConn),
 		udpBufferPool: sync.Pool{
@@ -381,6 +408,7 @@ func (c *Client) ResetRuntimeState(resetSessionCookie bool) {
 	c.maxPackedBlocks = 1
 	c.fragmentLimits = sync.Map{}
 	c.dnsResponses = fragmentStore.New[clientDNSFragmentKey](32)
+	c.streamDataFragments = fragmentStore.New[clientStreamDataFragmentKey](64)
 	if c.localDNSCache != nil {
 		c.localDNSCache.ClearPending()
 	}
@@ -403,6 +431,9 @@ func (c *Client) ResetRuntimeState(resetSessionCookie bool) {
 	c.streamControlReplyMu.Lock()
 	c.streamControlReplies = make(map[streamControlReplyKey]cachedStreamControlReply, 16)
 	c.streamControlReplyMu.Unlock()
+	c.streamControlStateMu.Lock()
+	c.streamControlStates = make(map[streamControlStateKey]clientStreamControlState, 8)
+	c.streamControlStateMu.Unlock()
 
 	c.resolverConnsMu.Lock()
 	for _, pool := range c.resolverConns {
@@ -648,6 +679,7 @@ func (c *Client) deleteStream(streamID uint16) {
 	delete(c.streams, streamID)
 	c.noteClosedStreamLocked(streamID, time.Now())
 	c.streamsMu.Unlock()
+	c.removeStreamDataFragments(streamID)
 	if stream != nil && stream.Conn != nil {
 		stream.stopOnce.Do(func() {
 			close(stream.StopCh)
@@ -665,6 +697,9 @@ func (c *Client) closeAllStreams() {
 	c.streams = make(map[uint16]*clientStream, 16)
 	c.closedStreams = make(map[uint16]int64, 16)
 	c.streamsMu.Unlock()
+	if c.streamDataFragments != nil {
+		c.streamDataFragments = fragmentStore.New[clientStreamDataFragmentKey](64)
+	}
 	for _, stream := range streams {
 		if stream == nil {
 			continue
@@ -818,6 +853,23 @@ func (c *Client) hasActiveStreamTXWork() bool {
 		if hasWork {
 			return true
 		}
+	}
+	return false
+}
+
+func (c *Client) hasPendingStreamControlWork() bool {
+	if c == nil {
+		return false
+	}
+	c.streamControlStateMu.Lock()
+	defer c.streamControlStateMu.Unlock()
+	now := time.Now()
+	for key, state := range c.streamControlStates {
+		if now.Sub(state.createdAt) > defaultRuntimeTimeout {
+			delete(c.streamControlStates, key)
+			continue
+		}
+		return true
 	}
 	return false
 }
