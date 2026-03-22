@@ -89,6 +89,7 @@ var ControlAckPairs = map[uint8]uint8{
 	Enums.PACKET_SOCKS5_ADDRESS_TYPE_UNSUPPORTED: Enums.PACKET_SOCKS5_ADDRESS_TYPE_UNSUPPORTED_ACK,
 	Enums.PACKET_SOCKS5_AUTH_FAILED:              Enums.PACKET_SOCKS5_AUTH_FAILED_ACK,
 	Enums.PACKET_SOCKS5_UPSTREAM_UNAVAILABLE:     Enums.PACKET_SOCKS5_UPSTREAM_UNAVAILABLE_ACK,
+	Enums.PACKET_SOCKS5_CONNECTED:                Enums.PACKET_SOCKS5_CONNECTED_ACK,
 }
 
 var setupControlPacketTypes = map[uint8]bool{
@@ -171,10 +172,11 @@ type ARQ struct {
 	lastDupAckTime time.Time
 
 	// SOCKS pre-connection payload handling
-	isSocks        bool
-	isVirtual      bool
-	initialData    []byte
-	socksConnected chan struct{}
+	isSocks           bool
+	isVirtual         bool
+	initialData       []byte
+	socksHandshake    chan struct{}
+	socksHandshakeErr uint8
 
 	// Concurrency
 	ctx    context.Context
@@ -248,7 +250,7 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 		isSocks:        cfg.IsSocks,
 		isVirtual:      cfg.IsVirtual,
 		initialData:    cfg.InitialData,
-		socksConnected: make(chan struct{}),
+		socksHandshake: make(chan struct{}),
 	}
 
 	// Apply Event unblock state
@@ -263,7 +265,7 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 	a.controlRto = time.Duration(minF(maxF(0.05, cfg.ControlRTO), userControlMaxRto) * float64(time.Second))
 
 	if !a.isSocks {
-		close(a.socksConnected)
+		close(a.socksHandshake)
 	}
 
 	a.ctx, a.cancel = context.WithCancel(context.Background())
@@ -336,16 +338,43 @@ func (a *ARQ) setState(newState StreamState) {
 func (a *ARQ) MarkSocksConnected() {
 	a.mu.Lock()
 	select {
-	case <-a.socksConnected:
+	case <-a.socksHandshake:
 		a.mu.Unlock()
 		return
 	default:
-		close(a.socksConnected)
+		a.socksHandshakeErr = 0 // Success
+		close(a.socksHandshake)
 	}
 	a.mu.Unlock()
 
 	a.flushReadyLocalData()
 	a.tryFinalizeRemoteEOF()
+}
+
+func (a *ARQ) MarkSocksFailed(errCode uint8) {
+	a.mu.Lock()
+	select {
+	case <-a.socksHandshake:
+		a.mu.Unlock()
+		return
+	default:
+		a.socksHandshakeErr = errCode
+		close(a.socksHandshake)
+	}
+	a.mu.Unlock()
+}
+
+func (a *ARQ) GetSocksHandshakeResult() (uint8, bool) {
+	select {
+	case <-a.socksHandshake:
+		return a.socksHandshakeErr, true
+	default:
+		return 0, false
+	}
+}
+
+func (a *ARQ) SocksHandshakeChan() <-chan struct{} {
+	return a.socksHandshake
 }
 
 // clearAllQueues is used to wipe state instantly (RST / Abort semantics)
@@ -484,7 +513,7 @@ func (a *ARQ) ioLoop() {
 	}
 
 	select {
-	case <-a.socksConnected:
+	case <-a.socksHandshake:
 	case <-a.ctx.Done():
 		return
 	}
@@ -649,7 +678,7 @@ func (a *ARQ) tryFinalizeRemoteEOF() {
 
 	if a.isSocks {
 		select {
-		case <-a.socksConnected:
+		case <-a.socksHandshake:
 		default:
 			return
 		}
@@ -675,7 +704,7 @@ func (a *ARQ) flushReadyLocalData() {
 
 	if a.isSocks {
 		select {
-		case <-a.socksConnected:
+		case <-a.socksHandshake:
 		default:
 			return
 		}
@@ -1104,4 +1133,10 @@ func (a *ARQ) ForceClose(reason string) {
 	} else {
 		a.Close(reason, false)
 	}
+}
+
+
+// Done returns a channel that is closed when the ARQ context is cancelled or the stream is closed.
+func (a *ARQ) Done() <-chan struct{} {
+	return a.ctx.Done()
 }

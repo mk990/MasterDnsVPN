@@ -155,7 +155,51 @@ func (c *Client) NotifyPacket(packetType uint8, isInbound bool) {
 }
 
 func (c *Client) HandleStreamPacket(packet VpnProto.Packet) error {
+	if !packet.HasStreamID {
+		return nil
+	}
+
+	c.streamsMu.Lock()
+	s, ok := c.active_streams[packet.StreamID]
+	c.streamsMu.Unlock()
+
+	if !ok || s == nil {
+		// Stream not found, potentially old packet or race condition
+		return nil
+	}
+
+	arqObj, ok := s.Stream.(*arq.ARQ)
+	if !ok {
+		return nil
+	}
+
+	switch packet.PacketType {
+	case Enums.PACKET_STREAM_DATA, Enums.PACKET_STREAM_RESEND:
+		arqObj.ReceiveData(packet.SequenceNum, packet.Payload)
+	case Enums.PACKET_STREAM_DATA_ACK:
+		arqObj.ReceiveAck(packet.SequenceNum)
+	default:
+		// Handle generic control ACKs (acks to our SYN, etc.)
+		arqObj.ReceiveControlAck(packet.PacketType, packet.SequenceNum, packet.FragmentID)
+	}
+
 	return nil
+}
+
+func (c *Client) getStreamARQ(streamID uint16) (*arq.ARQ, error) {
+	c.streamsMu.Lock()
+	s, ok := c.active_streams[streamID]
+	c.streamsMu.Unlock()
+
+	if !ok || s == nil {
+		return nil, fmt.Errorf("stream not found")
+	}
+
+	arqObj, ok := s.Stream.(*arq.ARQ)
+	if !ok {
+		return nil, fmt.Errorf("stream is not ARQ")
+	}
+	return arqObj, nil
 }
 
 func (c *Client) HandlePackedControlBlocks(payload []byte) error {
@@ -402,6 +446,19 @@ func (c *Client) Run(ctx context.Context) error {
 					}
 					continue
 				}
+
+				if c.syncedUploadMTU <= 0 || c.syncedDownloadMTU <= 0 {
+					c.successMTUChecks = false
+					c.log.Errorf("<red>❌ MTU tests failed: Upload MTU: %d, Download MTU: %d</red>", c.syncedUploadMTU, c.syncedDownloadMTU)
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(5 * time.Second):
+					}
+					continue
+				}
+
+				c.successMTUChecks = true
 			}
 
 			if !c.sessionReady {
