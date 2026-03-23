@@ -252,7 +252,17 @@ func (c *Client) HandleSOCKS5Connect(ctx context.Context, conn net.Conn, addr st
 	sn := uint16(0) // Protocol usually uses 0 for SYN
 
 	for i, frag := range fragments {
-		arqObj.SendControlPacket(Enums.PACKET_SOCKS5_SYN, sn, uint8(i), total, frag, Enums.DefaultPacketPriority(Enums.PACKET_SOCKS5_SYN), true, nil)
+		arqObj.SendControlPacketWithTTL(
+			Enums.PACKET_SOCKS5_SYN,
+			sn,
+			uint8(i),
+			total,
+			frag,
+			Enums.DefaultPacketPriority(Enums.PACKET_SOCKS5_SYN),
+			true,
+			nil,
+			120*time.Second,
+		)
 	}
 }
 
@@ -485,13 +495,17 @@ func (c *Client) HandleSocksConnected(packet VpnProto.Packet) error {
 	if ok && s.StatusValue() == streamStatusCancelled {
 		if arqObj, err := c.getStreamARQ(packet.StreamID); err == nil {
 			arqObj.MarkSocksFailed(Enums.PACKET_STREAM_RST)
+			arqObj.Abort("late SOCKS success after local cancellation", false)
 		}
-		c.removeStream(packet.StreamID)
 		return nil
 	}
 
 	if err := c.writeSocksConnectResult(packet.StreamID, SOCKS5_REPLY_SUCCESS); err != nil {
 		if errors.Is(err, errLateSocksResult) {
+			if arqObj, arqErr := c.getStreamARQ(packet.StreamID); arqErr == nil {
+				arqObj.MarkSocksFailed(Enums.PACKET_STREAM_RST)
+				arqObj.Abort("late SOCKS success result", false)
+			}
 			return nil
 		}
 		c.handlePendingSOCKSLocalClose(packet.StreamID, "failed to write SOCKS success reply")
@@ -523,13 +537,17 @@ func (c *Client) HandleSocksFailure(packet VpnProto.Packet) error {
 		arqObj, err := c.getStreamARQ(packet.StreamID)
 		if err == nil {
 			arqObj.MarkSocksFailed(packet.PacketType)
+			arqObj.Abort("SOCKS failure received after local cancellation", false)
 		}
-		c.removeStream(packet.StreamID)
 		return nil
 	}
 
 	if err := c.writeSocksConnectResult(packet.StreamID, socksReplyForPacketType(packet.PacketType)); err != nil {
 		if errors.Is(err, errLateSocksResult) {
+			if arqObj, arqErr := c.getStreamARQ(packet.StreamID); arqErr == nil {
+				arqObj.MarkSocksFailed(packet.PacketType)
+				arqObj.Abort("late SOCKS failure result", false)
+			}
 			return nil
 		}
 		c.handlePendingSOCKSLocalClose(packet.StreamID, "failed to write SOCKS failure reply")
@@ -543,7 +561,7 @@ func (c *Client) HandleSocksFailure(packet VpnProto.Packet) error {
 	}
 
 	arqObj.MarkSocksFailed(packet.PacketType)
-	c.removeStream(packet.StreamID)
+	arqObj.Abort("SOCKS failure received", false)
 	return nil
 }
 
