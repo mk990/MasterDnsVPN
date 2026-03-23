@@ -280,12 +280,7 @@ func (c *Client) dispatchDNSQueryToTunnel(query []byte) {
 	}
 
 	// Calculate target MTU for fragments
-	mtu := c.syncedUploadMTU - VpnProto.MaxHeaderRawSize()
-	if mtu < 100 {
-		mtu = 120 // Absolute minimum fallback
-	}
-
-	fragments := fragmentPayload(query, mtu)
+	fragments := fragmentPayload(query, c.syncedUploadMTU)
 	total := uint8(len(fragments))
 
 	// Generate a unique sequence number for this DNS query

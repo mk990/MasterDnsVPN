@@ -368,13 +368,15 @@ func (c *Client) handlePendingSOCKSLocalClose(streamID uint16, reason string) {
 	}
 
 	s.SetStatus(streamStatusCancelled)
+	s.stopPendingSOCKSWatch(false)
 	if s.NetConn != nil {
 		_ = s.NetConn.Close()
 	}
+	s.MarkTerminal(time.Now())
 
 	arqObj, err := c.getStreamARQ(streamID)
 	if err == nil {
-		arqObj.CancelPendingSOCKS(reason)
+		arqObj.MarkSocksFailed(Enums.PACKET_STREAM_RST)
 	}
 }
 
@@ -492,7 +494,13 @@ func (c *Client) HandleSocksConnected(packet VpnProto.Packet) error {
 		return nil
 	}
 
-	if s.StatusValue() == streamStatusActive {
+	s.socksResultMu.Lock()
+	defer s.socksResultMu.Unlock()
+
+	switch s.StatusValue() {
+	case streamStatusActive:
+		return nil
+	case streamStatusSocksFailed, streamStatusDraining, streamStatusClosing, streamStatusTimeWait, streamStatusClosed:
 		return nil
 	}
 
@@ -534,6 +542,9 @@ func (c *Client) HandleSocksFailure(packet VpnProto.Packet) error {
 		c.handleMissingStreamPacket(packet)
 		return nil
 	}
+
+	s.socksResultMu.Lock()
+	defer s.socksResultMu.Unlock()
 
 	switch s.StatusValue() {
 	case streamStatusSocksFailed, streamStatusDraining, streamStatusClosing, streamStatusTimeWait, streamStatusClosed:

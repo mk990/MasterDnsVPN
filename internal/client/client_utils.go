@@ -203,9 +203,11 @@ func (c *Client) handleMissingStreamPacket(packet VpnProto.Packet) {
 	}
 
 	switch packet.PacketType {
+	case Enums.PACKET_STREAM_FIN:
+		c.enqueueOrphanReset(Enums.PACKET_STREAM_FIN_ACK, packet.StreamID, packet.SequenceNum)
 	case Enums.PACKET_STREAM_RST:
 		c.enqueueOrphanReset(Enums.PACKET_STREAM_RST_ACK, packet.StreamID, packet.SequenceNum)
-	case Enums.PACKET_STREAM_RST_ACK:
+	case Enums.PACKET_STREAM_FIN_ACK, Enums.PACKET_STREAM_RST_ACK:
 		return
 	default:
 		c.enqueueOrphanReset(Enums.PACKET_STREAM_RST, packet.StreamID, 0)

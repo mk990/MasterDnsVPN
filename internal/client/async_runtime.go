@@ -21,7 +21,10 @@ import (
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
-const clientTerminalStreamRetention = 45 * time.Second
+const (
+	clientTerminalStreamRetention = 45 * time.Second
+	clientCancelledSetupRetention = 120 * time.Second
+)
 
 type asyncPacket struct {
 	conn       Connection
@@ -191,6 +194,11 @@ func (c *Client) asyncStreamCleanupWorker(ctx context.Context) {
 				}
 
 				if !a.IsClosed() {
+					if s.StatusValue() == streamStatusCancelled {
+						if since := s.TerminalSince(); !since.IsZero() && now.Sub(since) >= clientCancelledSetupRetention {
+							removeIDs = append(removeIDs, s.StreamID)
+						}
+					}
 					continue
 				}
 

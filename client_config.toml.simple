@@ -55,12 +55,6 @@ LOCAL_DNS_PORT = 53
 # Used to speed up recurring lookups and reduce tunnel traffic.
 LOCAL_DNS_CACHE_MAX_RECORDS = 5000
 LOCAL_DNS_CACHE_TTL_SECONDS = 28800.0  # 8 hours
-LOCAL_DNS_PENDING_TIMEOUT_SECONDS = 300.0
-
-# Persistence settings for the local DNS cache.
-LOCAL_DNS_CACHE_PERSIST_TO_FILE = true
-LOCAL_DNS_CACHE_FLUSH_INTERVAL_SECONDS = 60.0
-
 # ------------------------------------------------------------------------------
 # 4) Resolver Selection & Reliability
 # ------------------------------------------------------------------------------
@@ -128,6 +122,7 @@ MTU_SERVERS_FILE_FORMAT = "{IP} - UP: {UP_MTU} DOWN: {DOWN-MTU}"
 MTU_USING_SECTION_SEPARATOR_TEXT = ""
 MTU_REMOVED_SERVER_LOG_FORMAT = ""
 MTU_ADDED_SERVER_LOG_FORMAT = ""
+PACKET_DUPLICATION_COUNT = 2
 
 # ------------------------------------------------------------------------------
 # 6) Logging

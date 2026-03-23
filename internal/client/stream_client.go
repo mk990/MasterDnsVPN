@@ -63,13 +63,15 @@ type Stream_client struct {
 	LastResolverFailoverAt time.Time
 	HandshakeLastProgress  time.Time
 
-	statusMu           sync.RWMutex
-	terminalSince      time.Time
-	pendingWatchCancel chan struct{}
-	pendingWatchDone   chan struct{}
-	pendingWatchOnce   sync.Once
-	pendingLocalDataMu sync.Mutex
-	pendingLocalData   [][]byte
+	statusMu             sync.RWMutex
+	terminalSince        time.Time
+	pendingWatchCancel   chan struct{}
+	pendingWatchDone     chan struct{}
+	pendingWatchOnce     sync.Once
+	pendingWatchStopOnce sync.Once
+	pendingLocalDataMu   sync.Mutex
+	pendingLocalData     [][]byte
+	socksResultMu        sync.Mutex
 }
 
 // get_new_stream_id finds the next available stream ID using a circular counter (1-65535).
@@ -136,14 +138,14 @@ func (c *Client) new_stream(streamID uint16, conn net.Conn, targetPayload []byte
 
 	arqCfg := arq.Config{
 		WindowSize:               c.cfg.ARQWindowSize,
-		RTO:                      0.2, // Fast retry out of the gate
-		MaxRTO:                   1.5,
+		RTO:                      0.5,
+		MaxRTO:                   2.0,
 		IsSocks:                  c.cfg.ProtocolType == "SOCKS5",
 		IsClient:                 true,
 		InitialData:              targetPayload,
 		EnableControlReliability: true,
-		ControlRTO:               0.8,
-		ControlMaxRTO:            2.5,
+		ControlRTO:               0.5,
+		ControlMaxRTO:            2.0,
 		ControlMaxRetries:        40,
 		InactivityTimeout:        1200.0,
 		DataPacketTTL:            600.0,
@@ -413,11 +415,9 @@ func (s *Stream_client) stopPendingSOCKSWatch(wait bool) {
 		return
 	}
 
-	select {
-	case <-s.pendingWatchCancel:
-	default:
+	s.pendingWatchStopOnce.Do(func() {
 		close(s.pendingWatchCancel)
-	}
+	})
 
 	if wait && s.pendingWatchDone != nil {
 		select {
@@ -475,14 +475,14 @@ func (c *Client) InitVirtualStream0() {
 
 	arqCfg := arq.Config{
 		WindowSize:               c.cfg.ARQWindowSize,
-		RTO:                      0.2, // Fast retry out of the gate
-		MaxRTO:                   1.5,
+		RTO:                      0.5,
+		MaxRTO:                   2.0,
 		IsSocks:                  false,
 		IsClient:                 true,
 		IsVirtual:                true, // Bypasses internal timeout closures
 		EnableControlReliability: true,
-		ControlRTO:               0.8,
-		ControlMaxRTO:            2.5,
+		ControlRTO:               0.5,
+		ControlMaxRTO:            2.0,
 		ControlMaxRetries:        40,
 		InactivityTimeout:        999999.0, // Infinite
 		DataPacketTTL:            999999.0,

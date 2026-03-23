@@ -766,14 +766,10 @@ func (a *ARQ) ioLoop() {
 }
 
 func (a *ARQ) shouldAbortOnLocalEOF() bool {
-	if !a.isClient {
-		return false
-	}
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	return len(a.sndBuf) > 0
+	// Treat a clean local EOF as a graceful half-close even if outbound data is
+	// still pending. The remaining sndBuf should be drained and then FIN should
+	// be emitted, instead of resetting the stream immediately.
+	return false
 }
 
 func (a *ARQ) finReceivedLocked() bool {
@@ -976,6 +972,7 @@ func (a *ARQ) emitTerminalPacketWithTTL(packetType uint8, reason string, ttl tim
 		a.ackWaitDeadline = time.Now().Add(a.terminalAckWait)
 		a.mu.Unlock()
 
+		a.logger.Debugf("⚠️ <yellow>ARQ RST Trigger</yellow> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Stream</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Source</blue>: <cyan>emitTerminalPacket</cyan> <magenta>|</magenta> <blue>Reason</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>TTL</blue>: <cyan>%s</cyan>", a.sessionID, a.streamID, reason, ttl)
 		sn := a.sndNxt
 		a.MarkRstSent(&sn)
 		ackType := uint8(Enums.PACKET_STREAM_RST_ACK)
@@ -1563,6 +1560,13 @@ func (a *ARQ) Abort(reason string, sendRst bool) {
 
 	a.mu.Lock()
 	if a.closed || a.isVirtual {
+		a.mu.Unlock()
+		return
+	}
+	alreadyAborting := a.rstSent || a.rstReceived ||
+		(a.waitingAck && a.waitingAckFor == Enums.PACKET_STREAM_RST) ||
+		(a.deferredClose && a.deferredPacket == Enums.PACKET_STREAM_RST)
+	if alreadyAborting {
 		a.mu.Unlock()
 		return
 	}

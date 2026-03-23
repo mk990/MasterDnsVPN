@@ -141,7 +141,7 @@ func TestServerNaturalEOFDrainsOutstandingDataBeforeSendingFIN(t *testing.T) {
 	}
 }
 
-func TestClientEOFWithOutstandingDataSendsRST(t *testing.T) {
+func TestClientEOFWithOutstandingDataDrainsThenSendsFIN(t *testing.T) {
 	conn := newScriptedConn([]byte("hello"))
 	enq := &recordingEnqueuer{}
 	a := NewARQ(2, 1, enq, conn, 1200, nil, Config{
@@ -156,12 +156,22 @@ func TestClientEOFWithOutstandingDataSendsRST(t *testing.T) {
 	defer a.ForceClose("test cleanup")
 
 	waitUntil(t, time.Second, func() bool {
-		return enq.has(Enums.PACKET_STREAM_RST)
-	}, "expected client-side ARQ to send RST after local EOF with outstanding data")
+		return enq.has(Enums.PACKET_STREAM_DATA)
+	}, "expected client-side ARQ to enqueue initial STREAM_DATA")
 
+	time.Sleep(100 * time.Millisecond)
 	if enq.has(Enums.PACKET_STREAM_FIN) {
-		t.Fatal("did not expect FIN for client-side explicit cancel with outstanding data")
+		t.Fatal("FIN was sent before outstanding data ACKed")
 	}
+	if enq.has(Enums.PACKET_STREAM_RST) {
+		t.Fatal("did not expect RST after clean local EOF with outstanding data")
+	}
+
+	a.ReceiveAck(0)
+
+	waitUntil(t, time.Second, func() bool {
+		return enq.has(Enums.PACKET_STREAM_FIN)
+	}, "expected client-side ARQ to send FIN after outstanding data drained")
 }
 
 func TestRemoteFINWaitsForMissingTailDataBeforeClosing(t *testing.T) {

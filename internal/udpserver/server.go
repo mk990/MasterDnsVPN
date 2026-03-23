@@ -849,13 +849,13 @@ func (s *Server) queueSessionPacket(sessionID uint8, packet VpnProto.Packet) boo
 func (s *Server) streamARQConfig(isSocks bool, compressionType uint8) arq.Config {
 	return arq.Config{
 		WindowSize:               s.cfg.ARQWindowSize,
-		RTO:                      0.2,
-		MaxRTO:                   1.5,
+		RTO:                      0.5,
+		MaxRTO:                   2.0,
 		IsSocks:                  isSocks,
 		IsClient:                 false,
 		EnableControlReliability: true,
-		ControlRTO:               0.8,
-		ControlMaxRTO:            2.5,
+		ControlRTO:               0.5,
+		ControlMaxRTO:            2.0,
 		ControlMaxRetries:        40,
 		InactivityTimeout:        1200.0,
 		DataPacketTTL:            600.0,
