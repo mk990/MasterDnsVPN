@@ -259,6 +259,7 @@ func (s *Server) collectSOCKS5SynFragments(sessionID uint8, streamID uint16, seq
 	if totalFragments == 0 {
 		totalFragments = 1
 	}
+
 	assembled, ready, completed := s.socks5Fragments.Collect(
 		socks5FragmentKey{
 			sessionID:   sessionID,
@@ -271,6 +272,7 @@ func (s *Server) collectSOCKS5SynFragments(sessionID uint8, streamID uint16, seq
 		now,
 		s.dnsFragmentTimeout,
 	)
+
 	return assembled, ready, completed
 }
 

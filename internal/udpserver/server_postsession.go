@@ -32,7 +32,7 @@ func (s *Server) dispatchPostSessionPacket(vpnPacket VpnProto.Packet, sessionRec
 	case Enums.PACKET_PING:
 		return s.handlePingRequest(vpnPacket, sessionRecord)
 	case Enums.PACKET_STREAM_DATA, Enums.PACKET_STREAM_RESEND:
-		return s.handleStreamDataRequest(vpnPacket, sessionRecord)
+		return s.handleStreamDataRequest(vpnPacket)
 	case Enums.PACKET_DNS_QUERY_REQ:
 		return s.handleDNSQueryRequest(vpnPacket, sessionRecord)
 	case Enums.PACKET_STREAM_SYN:
@@ -40,9 +40,9 @@ func (s *Server) dispatchPostSessionPacket(vpnPacket VpnProto.Packet, sessionRec
 	case Enums.PACKET_SOCKS5_SYN:
 		return s.handleSOCKS5SynRequest(vpnPacket, sessionRecord)
 	case Enums.PACKET_STREAM_FIN:
-		return s.handleStreamFinRequest(vpnPacket, sessionRecord)
+		return s.handleStreamFinRequest(vpnPacket)
 	case Enums.PACKET_STREAM_RST:
-		return s.handleStreamRSTRequest(vpnPacket, sessionRecord)
+		return s.handleStreamRSTRequest(vpnPacket)
 	default:
 		return false
 	}
@@ -324,12 +324,14 @@ func (s *Server) handleDNSQueryResponseAck(vpnPacket VpnProto.Packet, sessionRec
 }
 
 func (s *Server) handleStreamSynRequest(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) bool {
-	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum || sessionRecord == nil {
+	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || sessionRecord == nil {
 		return false
 	}
+
 	run := func() {
-		s.processDeferredStreamSyn(vpnPacket, sessionRecord)
+		s.processDeferredStreamSyn(vpnPacket)
 	}
+
 	if !s.dispatchDeferredSessionPacket(vpnPacket, run) {
 		run()
 	}
@@ -337,34 +339,12 @@ func (s *Server) handleStreamSynRequest(vpnPacket VpnProto.Packet, sessionRecord
 }
 
 func (s *Server) handleSOCKS5SynRequest(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) bool {
-	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum || sessionRecord == nil {
-		return false
-	}
-
-	record, ok := s.sessions.Get(vpnPacket.SessionID)
-	if !ok {
-		return false
-	}
-	if record.isRecentlyClosed(vpnPacket.StreamID, time.Now()) {
-		record.enqueueOrphanReset(Enums.PACKET_STREAM_RST, vpnPacket.StreamID, 0)
-		return true
-	}
-	run := func() {
-		s.processDeferredSOCKS5Syn(vpnPacket, sessionRecord)
-	}
-	if !s.dispatchDeferredSessionPacket(vpnPacket, run) {
-		run()
-	}
-	return true
-}
-
-func (s *Server) handleStreamDataRequest(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) bool {
-	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum || sessionRecord == nil {
+	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || sessionRecord == nil {
 		return false
 	}
 
 	run := func() {
-		s.processDeferredStreamData(vpnPacket, sessionRecord)
+		s.processDeferredSOCKS5Syn(vpnPacket)
 	}
 
 	if !s.dispatchDeferredSessionPacket(vpnPacket, run) {
@@ -374,7 +354,29 @@ func (s *Server) handleStreamDataRequest(vpnPacket VpnProto.Packet, sessionRecor
 	return true
 }
 
-func (s *Server) handleStreamFinRequest(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) bool {
+func (s *Server) handleStreamDataRequest(vpnPacket VpnProto.Packet) bool {
+	run := func() {
+		record, ok := s.sessions.Get(vpnPacket.SessionID)
+		if !ok {
+			return
+		}
+
+		stream, exists := record.getStream(vpnPacket.StreamID)
+		if !exists || stream == nil {
+			return
+		}
+
+		stream.ARQ.ReceiveData(vpnPacket.SequenceNum, vpnPacket.Payload)
+	}
+
+	if !s.dispatchDeferredSessionPacket(vpnPacket, run) {
+		run()
+	}
+
+	return true
+}
+
+func (s *Server) handleStreamFinRequest(vpnPacket VpnProto.Packet) bool {
 	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 || !vpnPacket.HasSequenceNum {
 		return false
 	}
@@ -383,6 +385,7 @@ func (s *Server) handleStreamFinRequest(vpnPacket VpnProto.Packet, sessionRecord
 	if !ok {
 		return false
 	}
+
 	stream, exists := record.getStream(vpnPacket.StreamID)
 	if !exists || stream == nil {
 		return false
@@ -392,7 +395,7 @@ func (s *Server) handleStreamFinRequest(vpnPacket VpnProto.Packet, sessionRecord
 	return true
 }
 
-func (s *Server) handleStreamRSTRequest(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) bool {
+func (s *Server) handleStreamRSTRequest(vpnPacket VpnProto.Packet) bool {
 	if !vpnPacket.HasStreamID || vpnPacket.StreamID == 0 {
 		return false
 	}

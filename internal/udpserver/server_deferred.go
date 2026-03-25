@@ -44,7 +44,7 @@ func (s *Server) processDeferredDNSQuery(sessionID uint8, sequenceNum uint16, do
 	}
 }
 
-func (s *Server) processDeferredStreamSyn(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) {
+func (s *Server) processDeferredStreamSyn(vpnPacket VpnProto.Packet) {
 	record, ok := s.sessions.Get(vpnPacket.SessionID)
 	if !ok {
 		return
@@ -99,16 +99,18 @@ func (s *Server) processDeferredStreamSyn(vpnPacket VpnProto.Packet, sessionReco
 	}
 }
 
-func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) {
+func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet) {
 	record, ok := s.sessions.Get(vpnPacket.SessionID)
 	if !ok {
 		return
 	}
+
 	now := time.Now()
 	totalFragments := vpnPacket.TotalFragments
 	if totalFragments == 0 {
 		totalFragments = 1
 	}
+
 	assembledTarget, ready, completed := s.collectSOCKS5SynFragments(
 		vpnPacket.SessionID,
 		vpnPacket.StreamID,
@@ -124,14 +126,24 @@ func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet, sessionReco
 	}
 
 	stream := record.getOrCreateStream(vpnPacket.StreamID, s.streamARQConfig(true, record.DownloadCompression), nil, s.log)
-
 	target, err := SocksProto.ParseTargetPayload(assembledTarget)
 	if err != nil {
 		packetType := uint8(Enums.PACKET_SOCKS5_CONNECT_FAIL)
 		if errors.Is(err, SocksProto.ErrUnsupportedAddressType) || errors.Is(err, SocksProto.ErrInvalidDomainLength) {
 			packetType = uint8(Enums.PACKET_SOCKS5_ADDRESS_TYPE_UNSUPPORTED)
 		}
-		_ = s.sendTrackedSOCKSResult(stream, packetType, vpnPacket.SequenceNum, 60*time.Second)
+
+		stream.ARQ.SendControlPacketWithTTL(
+			packetType,
+			vpnPacket.SequenceNum,
+			0,
+			0,
+			nil,
+			Enums.DefaultPacketPriority(packetType),
+			true,
+			nil,
+			120*time.Second,
+		)
 		return
 	}
 
@@ -146,11 +158,32 @@ func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet, sessionReco
 			if s.log != nil {
 				s.log.Debugf("🧦 <green>SOCKS5_SYN Fast-Ack (Existing), Session: <cyan>%d</cyan> | Stream: <cyan>%d</cyan></green>", vpnPacket.SessionID, vpnPacket.StreamID)
 			}
-			_ = s.sendTrackedSOCKSResult(stream, Enums.PACKET_SOCKS5_CONNECTED, vpnPacket.SequenceNum, 120*time.Second)
+
+			stream.ARQ.SendControlPacketWithTTL(
+				Enums.PACKET_SOCKS5_CONNECTED,
+				vpnPacket.SequenceNum,
+				0,
+				0,
+				nil,
+				Enums.DefaultPacketPriority(Enums.PACKET_SOCKS5_CONNECTED),
+				true,
+				nil,
+				300*time.Second,
+			)
 			return
 		}
 
-		_ = s.sendTrackedSOCKSResult(stream, Enums.PACKET_SOCKS5_CONNECT_FAIL, vpnPacket.SequenceNum, 60*time.Second)
+		stream.ARQ.SendControlPacketWithTTL(
+			Enums.PACKET_SOCKS5_CONNECT_FAIL,
+			vpnPacket.SequenceNum,
+			0,
+			0,
+			nil,
+			Enums.DefaultPacketPriority(Enums.PACKET_SOCKS5_CONNECT_FAIL),
+			true,
+			nil,
+			120*time.Second,
+		)
 		return
 	}
 
@@ -168,7 +201,17 @@ func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet, sessionReco
 				err,
 			)
 		}
-		_ = s.sendTrackedSOCKSResult(stream, packetType, vpnPacket.SequenceNum, 60*time.Second)
+		stream.ARQ.SendControlPacketWithTTL(
+			packetType,
+			vpnPacket.SequenceNum,
+			0,
+			0,
+			nil,
+			Enums.DefaultPacketPriority(packetType),
+			true,
+			nil,
+			120*time.Second,
+		)
 		return
 	}
 
@@ -192,34 +235,17 @@ func (s *Server) processDeferredSOCKS5Syn(vpnPacket VpnProto.Packet, sessionReco
 		)
 	}
 
-	_ = s.sendTrackedSOCKSResult(stream, Enums.PACKET_SOCKS5_CONNECTED, vpnPacket.SequenceNum, 120*time.Second)
-}
-
-func (s *Server) sendTrackedSOCKSResult(stream *Stream_server, packetType uint8, sequenceNum uint16, ttl time.Duration) bool {
-	if s == nil || stream == nil || stream.ARQ == nil {
-		return false
-	}
-
-	return stream.ARQ.SendControlPacketWithTTL(
-		packetType,
-		sequenceNum,
+	stream.ARQ.SendControlPacketWithTTL(
+		Enums.PACKET_SOCKS5_CONNECTED,
+		vpnPacket.SequenceNum,
 		0,
 		0,
 		nil,
-		Enums.DefaultPacketPriority(packetType),
+		Enums.DefaultPacketPriority(Enums.PACKET_SOCKS5_CONNECTED),
 		true,
 		nil,
-		ttl,
+		300*time.Second,
 	)
-}
-
-func (s *Server) processDeferredStreamData(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) {
-	record, ok := s.sessions.Get(vpnPacket.SessionID)
-	if !ok {
-		return
-	}
-	stream := record.getOrCreateStream(vpnPacket.StreamID, s.streamARQConfig(false, record.DownloadCompression), nil, s.log)
-	stream.ARQ.ReceiveData(vpnPacket.SequenceNum, vpnPacket.Payload)
 }
 
 func (s *Server) mapSOCKSConnectError(err error) uint8 {

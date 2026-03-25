@@ -57,6 +57,7 @@ func (s *Store[K]) Collect(key K, payload []byte, fragmentID uint8, totalFragmen
 		s.completed[key] = now.Add(retention)
 		return append([]byte(nil), payload...), true, false
 	}
+
 	if fragmentID >= totalFragments {
 		return nil, false, false
 	}
@@ -85,6 +86,7 @@ func (s *Store[K]) Collect(key K, payload []byte, fragmentID uint8, totalFragmen
 	if current.chunks[fragmentID] == nil {
 		current.count++
 	}
+
 	current.chunks[fragmentID] = append(current.chunks[fragmentID][:0], payload...)
 
 	if current.count < totalFragments {
