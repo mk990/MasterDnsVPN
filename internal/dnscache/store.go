@@ -412,7 +412,7 @@ func (s *Store) LoadFromFile(path string, now time.Time) (int, error) {
 			if err == io.EOF {
 				break
 			}
-			continue
+			return 0, fmt.Errorf("read cache entry %d failed: %w", i, err)
 		}
 
 		if s.isExpired(&entry, now) {

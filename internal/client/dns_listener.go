@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -171,6 +172,9 @@ func (c *Client) loadLocalDNSCache() {
 	if err != nil {
 		if c.log != nil {
 			c.log.Warnf("💾 <yellow>Local DNS Cache <red>Load Failed:</red> %v</yellow>", err)
+		}
+		if removeErr := os.Remove(c.localDNSCachePath); removeErr != nil && !os.IsNotExist(removeErr) && c.log != nil {
+			c.log.Warnf("💾 <yellow>Local DNS Cache <red>Purge Failed:</red> %v</yellow>", removeErr)
 		}
 		return
 	}

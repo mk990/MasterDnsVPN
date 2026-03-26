@@ -2,6 +2,7 @@ package dnscache
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -67,13 +68,13 @@ func TestStore_Sharding(t *testing.T) {
 	now := time.Now()
 
 	// Fill shard-limited capacity
-	// Since maxRecords is 10, each shard gets 10/32 = 0? 
+	// Since maxRecords is 10, each shard gets 10/32 = 0?
 	// Ah, I set limit to maxRecords/shardCount in code.
 	// If maxRecords is 10, limit is 0 (set to 1).
-	
+
 	// Let's use more records
 	s = New(100, time.Hour, time.Minute) // 100/32 = 3 per shard
-	
+
 	for i := 0; i < 200; i++ {
 		domain := "domain" + string(rune(i))
 		key := BuildKey(domain, 1, 1)
@@ -85,11 +86,49 @@ func TestStore_Sharding(t *testing.T) {
 	for i := 0; i < shardCount; i++ {
 		count += len(s.shards[i].items)
 	}
-	
-	// Shards have a limit of maxRecords/shardCount. 
+
+	// Shards have a limit of maxRecords/shardCount.
 	// If 100/32 = 3, each bucket has max 3 items.
 	// 3 * 32 = 96.
 	if count > 100 {
 		t.Errorf("Total records %d exceeded target 100", count)
+	}
+}
+
+func TestStoreLoadFromFileFailsOnCorruptEntry(t *testing.T) {
+	tempDir := t.TempDir()
+	cachePath := filepath.Join(tempDir, "corrupt_cache.bin")
+
+	s := New(100, time.Hour, time.Minute)
+	now := time.Now()
+	key := BuildKey("example.com", 1, 1)
+	s.SetReady(key, "example.com", 1, 1, []byte("\x00\x00answer1"), now)
+
+	if _, err := s.SaveToFile(cachePath, now); err != nil {
+		t.Fatalf("SaveToFile failed: %v", err)
+	}
+
+	file, err := os.OpenFile(cachePath, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if _, err := file.Write([]byte{0x44, 0x4E, 0x53, 0x43, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xAA}); err != nil {
+		_ = file.Close()
+		t.Fatalf("Write failed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	s2 := New(100, time.Hour, time.Minute)
+	loaded, err := s2.LoadFromFile(cachePath, now)
+	if err == nil {
+		t.Fatal("expected LoadFromFile to fail on corrupt entry")
+	}
+	if loaded != 0 {
+		t.Fatalf("expected zero loaded entries on corrupt file, got %d", loaded)
+	}
+	if _, ok := s2.GetReady(key, []byte("\x12\x34"), now); ok {
+		t.Fatal("expected corrupt load not to retain partially loaded cache entries")
 	}
 }
