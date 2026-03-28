@@ -249,11 +249,12 @@ func (s *Server) dequeueSessionResponse(sessionID uint8, now time.Time) (*VpnPro
 	}
 
 	record.mu.Lock()
-	defer record.mu.Unlock()
-
 	if pkt, ok := s.dequeueDuplicatedPackedControlBlock(record); ok {
+		record.mu.Unlock()
 		return pkt, true
 	}
+	rrStreamID := record.RRStreamID
+	record.mu.Unlock()
 
 	record.StreamsMu.RLock()
 	streamCount := len(record.ActiveStreams)
@@ -274,7 +275,7 @@ func (s *Server) dequeueSessionResponse(sessionID uint8, now time.Time) (*VpnPro
 
 	startIdx := 0
 	for i, id := range ids {
-		if id >= record.RRStreamID {
+		if id >= rrStreamID {
 			startIdx = i
 			break
 		}
@@ -326,12 +327,15 @@ func (s *Server) dequeueSessionResponse(sessionID uint8, now time.Time) (*VpnPro
 		}
 
 		if ok && item != nil {
+			record.mu.Lock()
 			record.RRStreamID = id + 1
 			if VpnProto.IsPackableControlPacket(item.PacketType, len(item.Payload)) && record.MaxPackedBlocks > 1 {
 				pkt := s.packControlBlocks(record, item, id, selectedStreamID)
 				s.cachePackedControlBlockDuplicate(record, pkt)
+				record.mu.Unlock()
 				return pkt, true
 			}
+			record.mu.Unlock()
 			pkt := vpnPacketFromTX(item, selectedStreamID)
 			return &pkt, true
 		}
