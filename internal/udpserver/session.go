@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,37 +36,53 @@ const (
 type sessionRecord struct {
 	mu sync.RWMutex
 
-	ID                   uint8
-	Cookie               uint8
-	ResponseMode         uint8
-	UploadCompression    uint8
-	DownloadCompression  uint8
-	UploadMTU            uint16
-	DownloadMTU          uint16
-	DownloadMTUBytes     int
-	VerifyCode           [4]byte
-	Signature            [sessionInitDataSize]byte
-	MaxPackedBlocks      int
-	StreamReadBufferSize int
-	CreatedAt            time.Time
-	ReuseUntil           time.Time
-	reuseUntilUnixNano   int64
-	lastActivityUnixNano int64
+	ID                                  uint8
+	Cookie                              uint8
+	ResponseMode                        uint8
+	UploadCompression                   uint8
+	DownloadCompression                 uint8
+	UploadMTU                           uint16
+	DownloadMTU                         uint16
+	DownloadMTUBytes                    int
+	VerifyCode                          [4]byte
+	Signature                           [sessionInitDataSize]byte
+	MaxPackedBlocks                     int
+	StreamReadBufferSize                int
+	CreatedAt                           time.Time
+	ReuseUntil                          time.Time
+	reuseUntilUnixNano                  int64
+	lastActivityUnixNano                int64
+	lastDeferredCleanupActivityUnixNano int64
 
 	// New fields for ARQ refactor
 	Streams                         map[uint16]*Stream_server
 	ActiveStreams                   []uint16 // Sorted list of active stream IDs for Round-Robin
-	RRStreamID                      int32    // Last served stream ID for RR
-	EnqueueSeq                      uint64   // Global sequence for FIFO inside same priority
+	activeStreamSetVersion          uint64
+	activeStreamSnapshotIDs         []int32
+	activeStreamSnapshotStreams     []*Stream_server
+	activeStreamSnapshotVersion     uint64
+	ReadyStreams                    []uint16
+	readyStreamSetVersion           uint64
+	readyStreamSnapshotIDs          []int32
+	readyStreamSnapshotStreams      []*Stream_server
+	readyStreamSnapshotVersion      uint64
+	RRStreamID                      int32  // Last served stream ID for RR
+	EnqueueSeq                      uint64 // Global sequence for FIFO inside same priority
 	StreamQueueCap                  int
 	StreamsMu                       sync.RWMutex
-	RecentlyClosed                  map[uint16]time.Time
+	RecentlyClosed                  map[uint16]recentlyClosedStreamRecord
 	RecentlyClosedTTL               time.Duration
 	RecentlyClosedCap               int
 	OrphanQueue                     *mlq.MultiLevelQueue[VpnProto.Packet]
 	LastPackedControlBlock          *VpnProto.Packet
 	LastPackedControlBlockRemaining int
 	closedFlag                      uint32
+	streamCleanup                   func(uint8, uint16)
+}
+
+type recentlyClosedStreamRecord struct {
+	ClosedAt       time.Time
+	SuppressOrphan bool
 }
 
 // serverStreamTXPacket represents a queued packet pending transmission or retransmission.
@@ -145,6 +162,11 @@ type sessionValidationResult struct {
 type closedSessionCleanup struct {
 	ID     uint8
 	record *sessionRecord
+}
+
+type idleDeferredCleanup struct {
+	ID               uint8
+	lastActivityNano int64
 }
 
 type sessionStore struct {
@@ -241,8 +263,9 @@ func (s *sessionStore) findOrCreate(payload []byte, uploadCompressionType uint8,
 		Signature:         signature,
 		Streams:           make(map[uint16]*Stream_server),
 		ActiveStreams:     make([]uint16, 0, 8),
+		ReadyStreams:      make([]uint16, 0, 8),
 		StreamQueueCap:    s.streamQueueCap,
-		RecentlyClosed:    make(map[uint16]time.Time, 8),
+		RecentlyClosed:    make(map[uint16]recentlyClosedStreamRecord, 8),
 		RecentlyClosedTTL: s.recentlyClosedTTL,
 		RecentlyClosedCap: s.recentlyClosedCap,
 		OrphanQueue:       mlq.New[VpnProto.Packet](s.orphanQueueCap),
@@ -429,10 +452,9 @@ func (s *sessionStore) Cleanup(now time.Time, idleTimeout time.Duration, closedR
 		if record == nil {
 			continue
 		}
-		record.markClosed()
+
 		lastActivityUnixNano := record.lastActivity()
 		if lastActivityUnixNano != 0 && nowUnixNano-lastActivityUnixNano < idleTimeoutNanos {
-			record.reopen()
 			continue
 		}
 
@@ -448,6 +470,7 @@ func (s *sessionStore) Cleanup(now time.Time, idleTimeout time.Duration, closedR
 				ExpiresAt:    now.Add(closedRetention),
 			}
 		}
+		record.markClosed()
 		expired = append(expired, closedSessionCleanup{
 			ID:     uint8(sessionID),
 			record: record,
@@ -469,6 +492,21 @@ func (s *sessionStore) SweepTerminalStreams(now time.Time, retention time.Durati
 
 	for _, record := range records {
 		record.cleanupTerminalStreams(now, retention)
+	}
+}
+
+func (s *sessionStore) SweepRecentlyClosedStreams(now time.Time) {
+	s.mu.Lock()
+	records := make([]*sessionRecord, 0, len(s.byID))
+	for _, record := range s.byID {
+		if record != nil {
+			records = append(records, record)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, record := range records {
+		record.pruneRecentlyClosed(now)
 	}
 }
 
@@ -539,6 +577,50 @@ func (r *sessionRecord) setLastActivityUnixNano(nowUnixNano int64) {
 
 func (r *sessionRecord) lastActivity() int64 {
 	return atomic.LoadInt64(&r.lastActivityUnixNano)
+}
+
+func (s *sessionStore) CollectIdleDeferredSessions(now time.Time, idleTimeout time.Duration) []idleDeferredCleanup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if idleTimeout <= 0 {
+		return nil
+	}
+
+	nowUnixNano := now.UnixNano()
+	idleTimeoutNanos := idleTimeout.Nanoseconds()
+	idle := make([]idleDeferredCleanup, 0, 4)
+
+	for sessionID := 1; sessionID <= maxServerSessionID; sessionID++ {
+		record := s.byID[sessionID]
+		if record == nil || record.isClosed() {
+			continue
+		}
+
+		lastActivityUnixNano := record.lastActivity()
+		if lastActivityUnixNano == 0 || nowUnixNano-lastActivityUnixNano < idleTimeoutNanos {
+			continue
+		}
+		if record.lastDeferredCleanupActivity() == lastActivityUnixNano {
+			continue
+		}
+
+		record.markDeferredCleanupActivity(lastActivityUnixNano)
+		idle = append(idle, idleDeferredCleanup{
+			ID:               uint8(sessionID),
+			lastActivityNano: lastActivityUnixNano,
+		})
+	}
+
+	return idle
+}
+
+func (r *sessionRecord) lastDeferredCleanupActivity() int64 {
+	return atomic.LoadInt64(&r.lastDeferredCleanupActivityUnixNano)
+}
+
+func (r *sessionRecord) markDeferredCleanupActivity(activityUnixNano int64) {
+	atomic.StoreInt64(&r.lastDeferredCleanupActivityUnixNano, activityUnixNano)
 }
 
 func nextSessionID(current uint8) uint8 {
@@ -614,7 +696,11 @@ func (r *sessionRecord) getOrCreateStream(streamID uint16, arqConfig arq.Config,
 		return s
 	}
 
+	delete(r.RecentlyClosed, streamID)
+
 	s := NewStreamServer(streamID, r.ID, arqConfig, localConn, r.DownloadMTUBytes, r.StreamQueueCap, logger)
+	s.onClosed = r.onStreamClosed
+	s.onQueueStateChanged = r.onStreamQueueStateChanged
 	r.Streams[streamID] = s
 
 	// Active streams tracking: keep sorted for Round-Robin predictability
@@ -641,9 +727,41 @@ func (r *sessionRecord) getOrCreateStream(streamID uint16, arqConfig arq.Config,
 			r.ActiveStreams = append(r.ActiveStreams[:insertAt+1], r.ActiveStreams[insertAt:]...)
 			r.ActiveStreams[insertAt] = streamID
 		}
+		r.markActiveStreamsChangedLocked()
 	}
 
 	return s
+}
+
+func shouldSuppressServerOrphanForCloseReason(reason string) bool {
+	return strings.Contains(reason, "close handshake completed") ||
+		strings.HasSuffix(reason, "acknowledged")
+}
+
+func (r *sessionRecord) onStreamClosed(streamID uint16, now time.Time, reason string) {
+	if r == nil || streamID == 0 {
+		return
+	}
+	r.removeStream(streamID, now, shouldSuppressServerOrphanForCloseReason(reason))
+	if r.streamCleanup != nil {
+		r.streamCleanup(r.ID, streamID)
+	}
+}
+
+func (r *sessionRecord) onStreamQueueStateChanged(streamID uint16, hasItems bool) {
+	if r == nil || r.isClosed() || streamID == 0 {
+		return
+	}
+	r.StreamsMu.Lock()
+	defer r.StreamsMu.Unlock()
+	if _, exists := r.Streams[streamID]; !exists {
+		return
+	}
+	if hasItems {
+		r.markReadyStreamLocked(streamID)
+		return
+	}
+	r.removeReadyStreamLocked(streamID)
 }
 
 func (r *sessionRecord) getStream(streamID uint16) (*Stream_server, bool) {
@@ -655,36 +773,54 @@ func (r *sessionRecord) getStream(streamID uint16) (*Stream_server, bool) {
 	r.StreamsMu.RUnlock()
 	return s, ok
 }
-func (r *sessionRecord) noteStreamClosed(streamID uint16, now time.Time) {
+func (r *sessionRecord) noteStreamClosed(streamID uint16, now time.Time, suppressOrphan bool) {
 	if r == nil || r.isClosed() || streamID == 0 {
 		return
 	}
 	r.StreamsMu.Lock()
 	defer r.StreamsMu.Unlock()
 
-	// Cleanup old records
-	expiredBefore := now.Add(-r.closedStreamRecordTTL())
-	for id, closedAt := range r.RecentlyClosed {
-		if closedAt.Before(expiredBefore) {
-			delete(r.RecentlyClosed, id)
-		}
-	}
+	r.pruneRecentlyClosedLocked(now)
 
-	r.RecentlyClosed[streamID] = now
+	r.RecentlyClosed[streamID] = recentlyClosedStreamRecord{
+		ClosedAt:       now,
+		SuppressOrphan: suppressOrphan,
+	}
 
 	// Cap the map size
 	if len(r.RecentlyClosed) > r.closedStreamRecordCap() {
 		var oldestID uint16
 		var oldestAt time.Time
 		first := true
-		for id, closedAt := range r.RecentlyClosed {
-			if first || closedAt.Before(oldestAt) {
+		for id, record := range r.RecentlyClosed {
+			if first || record.ClosedAt.Before(oldestAt) {
 				oldestID = id
-				oldestAt = closedAt
+				oldestAt = record.ClosedAt
 				first = false
 			}
 		}
 		delete(r.RecentlyClosed, oldestID)
+	}
+}
+
+func (r *sessionRecord) pruneRecentlyClosed(now time.Time) {
+	if r == nil || r.isClosed() {
+		return
+	}
+	r.StreamsMu.Lock()
+	r.pruneRecentlyClosedLocked(now)
+	r.StreamsMu.Unlock()
+}
+
+func (r *sessionRecord) pruneRecentlyClosedLocked(now time.Time) {
+	if r == nil {
+		return
+	}
+	expiredBefore := now.Add(-r.closedStreamRecordTTL())
+	for id, record := range r.RecentlyClosed {
+		if record.ClosedAt.Before(expiredBefore) {
+			delete(r.RecentlyClosed, id)
+		}
 	}
 }
 
@@ -695,12 +831,27 @@ func (r *sessionRecord) isRecentlyClosed(streamID uint16, now time.Time) bool {
 	r.StreamsMu.RLock()
 	defer r.StreamsMu.RUnlock()
 
-	closedAt, ok := r.RecentlyClosed[streamID]
+	record, ok := r.RecentlyClosed[streamID]
 	if !ok {
 		return false
 	}
 
-	return now.Sub(closedAt) <= r.closedStreamRecordTTL()
+	return now.Sub(record.ClosedAt) <= r.closedStreamRecordTTL()
+}
+
+func (r *sessionRecord) shouldSuppressOrphanForClosedStream(streamID uint16, now time.Time) bool {
+	if r == nil || r.isClosed() {
+		return false
+	}
+	r.StreamsMu.RLock()
+	defer r.StreamsMu.RUnlock()
+
+	record, ok := r.RecentlyClosed[streamID]
+	if !ok {
+		return false
+	}
+
+	return now.Sub(record.ClosedAt) <= r.closedStreamRecordTTL() && record.SuppressOrphan
 }
 
 func (r *sessionRecord) closedStreamRecordTTL() time.Duration {
@@ -717,7 +868,7 @@ func (r *sessionRecord) closedStreamRecordCap() int {
 	return r.RecentlyClosedCap
 }
 
-func (r *sessionRecord) removeStream(streamID uint16, now time.Time) {
+func (r *sessionRecord) removeStream(streamID uint16, now time.Time, suppressOrphan bool) {
 	if r == nil || r.isClosed() || streamID == 0 {
 		return
 	}
@@ -725,9 +876,10 @@ func (r *sessionRecord) removeStream(streamID uint16, now time.Time) {
 	delete(r.Streams, streamID)
 
 	r.removeActiveStreamLocked(streamID)
+	r.removeReadyStreamLocked(streamID)
 	r.StreamsMu.Unlock()
 
-	r.noteStreamClosed(streamID, now)
+	r.noteStreamClosed(streamID, now, suppressOrphan)
 }
 
 func (r *sessionRecord) deactivateStream(streamID uint16) {
@@ -737,6 +889,7 @@ func (r *sessionRecord) deactivateStream(streamID uint16) {
 
 	r.StreamsMu.Lock()
 	r.removeActiveStreamLocked(streamID)
+	r.removeReadyStreamLocked(streamID)
 	r.StreamsMu.Unlock()
 }
 
@@ -744,9 +897,127 @@ func (r *sessionRecord) removeActiveStreamLocked(streamID uint16) {
 	for i, id := range r.ActiveStreams {
 		if id == streamID {
 			r.ActiveStreams = append(r.ActiveStreams[:i], r.ActiveStreams[i+1:]...)
+			r.markActiveStreamsChangedLocked()
 			break
 		}
 	}
+}
+
+func (r *sessionRecord) markActiveStreamsChangedLocked() {
+	r.activeStreamSetVersion++
+}
+
+func (r *sessionRecord) markReadyStreamsChangedLocked() {
+	r.readyStreamSetVersion++
+}
+
+func (r *sessionRecord) markReadyStreamLocked(streamID uint16) {
+	for _, id := range r.ReadyStreams {
+		if id == streamID {
+			return
+		}
+	}
+	insertAt := 0
+	for i, id := range r.ReadyStreams {
+		if id > streamID {
+			insertAt = i
+			break
+		}
+		insertAt = i + 1
+	}
+	if insertAt == len(r.ReadyStreams) {
+		r.ReadyStreams = append(r.ReadyStreams, streamID)
+	} else {
+		r.ReadyStreams = append(r.ReadyStreams[:insertAt+1], r.ReadyStreams[insertAt:]...)
+		r.ReadyStreams[insertAt] = streamID
+	}
+	r.markReadyStreamsChangedLocked()
+}
+
+func (r *sessionRecord) removeReadyStreamLocked(streamID uint16) {
+	for i, id := range r.ReadyStreams {
+		if id == streamID {
+			r.ReadyStreams = append(r.ReadyStreams[:i], r.ReadyStreams[i+1:]...)
+			r.markReadyStreamsChangedLocked()
+			break
+		}
+	}
+}
+
+func (r *sessionRecord) activeStreamSnapshot() ([]int32, []*Stream_server) {
+	if r == nil || r.isClosed() {
+		return nil, nil
+	}
+
+	r.StreamsMu.RLock()
+	version := r.activeStreamSetVersion
+	if version == r.activeStreamSnapshotVersion {
+		ids := r.activeStreamSnapshotIDs
+		streams := r.activeStreamSnapshotStreams
+		r.StreamsMu.RUnlock()
+		return ids, streams
+	}
+	r.StreamsMu.RUnlock()
+
+	r.StreamsMu.Lock()
+	defer r.StreamsMu.Unlock()
+
+	if r.activeStreamSetVersion != r.activeStreamSnapshotVersion {
+		snapshotIDs := make([]int32, len(r.ActiveStreams))
+		snapshotStreams := make([]*Stream_server, len(r.ActiveStreams))
+		for i, id := range r.ActiveStreams {
+			snapshotIDs[i] = int32(id)
+			snapshotStreams[i] = r.Streams[id]
+		}
+		r.activeStreamSnapshotIDs = snapshotIDs
+		r.activeStreamSnapshotStreams = snapshotStreams
+		r.activeStreamSnapshotVersion = r.activeStreamSetVersion
+	}
+
+	return r.activeStreamSnapshotIDs, r.activeStreamSnapshotStreams
+}
+
+func (r *sessionRecord) readyStreamSnapshot() ([]int32, []*Stream_server) {
+	if r == nil || r.isClosed() {
+		return nil, nil
+	}
+
+	r.StreamsMu.RLock()
+	version := r.readyStreamSetVersion
+	if version == r.readyStreamSnapshotVersion {
+		ids := r.readyStreamSnapshotIDs
+		streams := r.readyStreamSnapshotStreams
+		r.StreamsMu.RUnlock()
+		return ids, streams
+	}
+	r.StreamsMu.RUnlock()
+
+	r.StreamsMu.Lock()
+	defer r.StreamsMu.Unlock()
+
+	if r.readyStreamSetVersion != r.readyStreamSnapshotVersion {
+		filteredReady := make([]uint16, 0, len(r.ReadyStreams))
+		snapshotIDs := make([]int32, 0, len(r.ReadyStreams))
+		snapshotStreams := make([]*Stream_server, 0, len(r.ReadyStreams))
+		for _, id := range r.ReadyStreams {
+			stream := r.Streams[id]
+			if stream == nil || stream.FastTXQueueSize() == 0 {
+				continue
+			}
+			filteredReady = append(filteredReady, id)
+			snapshotIDs = append(snapshotIDs, int32(id))
+			snapshotStreams = append(snapshotStreams, stream)
+		}
+		if len(filteredReady) != len(r.ReadyStreams) {
+			r.ReadyStreams = filteredReady
+			r.readyStreamSetVersion++
+		}
+		r.readyStreamSnapshotIDs = snapshotIDs
+		r.readyStreamSnapshotStreams = snapshotStreams
+		r.readyStreamSnapshotVersion = r.readyStreamSetVersion
+	}
+
+	return r.readyStreamSnapshotIDs, r.readyStreamSnapshotStreams
 }
 
 func (r *sessionRecord) closeAllStreams(reason string) {
@@ -766,11 +1037,15 @@ func (r *sessionRecord) closeAllStreams(reason string) {
 
 	for _, stream := range streams {
 		stream.Abort(reason)
+		stream.finalizeAfterARQClose(reason)
 	}
 
 	r.StreamsMu.Lock()
 	clear(r.Streams)
 	r.ActiveStreams = r.ActiveStreams[:0]
+	r.ReadyStreams = r.ReadyStreams[:0]
+	r.markActiveStreamsChangedLocked()
+	r.markReadyStreamsChangedLocked()
 	r.StreamsMu.Unlock()
 
 	if r.OrphanQueue != nil {
@@ -807,12 +1082,13 @@ func (r *sessionRecord) cleanupTerminalStreams(now time.Time, retention time.Dur
 			stream.Status = "TIME_WAIT"
 		}
 
-		if stream.ARQ.IsClosed() {
+		forceClosedExpired := !stream.CloseTime.IsZero() && now.Sub(stream.CloseTime) >= retention
+		if stream.ARQ.IsClosed() || forceClosedExpired {
 			if stream.CloseTime.IsZero() {
 				stream.CloseTime = now
 			}
 			stream.Status = "TIME_WAIT"
-			if now.Sub(stream.CloseTime) >= retention {
+			if forceClosedExpired || now.Sub(stream.CloseTime) >= retention {
 				removeIDs = append(removeIDs, streamID)
 			}
 		}
@@ -822,8 +1098,9 @@ func (r *sessionRecord) cleanupTerminalStreams(now time.Time, retention time.Dur
 	for _, streamID := range removeIDs {
 		if stream, ok := snapshot[streamID]; ok && stream != nil {
 			stream.Abort("terminal stream retention cleanup")
+			stream.finalizeAfterARQClose("terminal stream retention cleanup")
 		}
-		r.removeStream(streamID, now)
+		r.removeStream(streamID, now, false)
 	}
 }
 

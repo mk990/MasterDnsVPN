@@ -48,7 +48,7 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 
 	endpoints := make([]ResolverAddress, 0, 64)
 	resolverMap := make(map[string]int, 64)
-	seenEndpoints := make(map[string]struct{}, 64)
+	seenIPs := make(map[string]struct{}, 64)
 
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
@@ -61,20 +61,20 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 
 		target, port, err := parseResolverEntry(line)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid resolver entry on line %d: %w", lineNum, err)
+			continue
 		}
 
 		if !target.isPrefix {
-			addResolver(&endpoints, resolverMap, seenEndpoints, target.addr.String(), port)
+			addResolver(&endpoints, resolverMap, seenIPs, target.addr.String(), port)
 			continue
 		}
 
 		usableHosts, ok := usableHostCount(target.prefix)
 		if !ok || usableHosts > maxResolverHosts {
-			return nil, nil, fmt.Errorf("resolver subnet on line %d expands to more than %d hosts", lineNum, maxResolverHosts)
+			continue
 		}
 
-		appendPrefixResolvers(&endpoints, resolverMap, seenEndpoints, target.prefix, port)
+		appendPrefixResolvers(&endpoints, resolverMap, seenIPs, target.prefix, port)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -94,12 +94,11 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 	return endpoints, resolverMap, nil
 }
 
-func addResolver(endpoints *[]ResolverAddress, resolverMap map[string]int, seenEndpoints map[string]struct{}, ip string, port int) {
-	endpointKey := makeResolverEndpointKey(ip, port)
-	if _, exists := seenEndpoints[endpointKey]; exists {
+func addResolver(endpoints *[]ResolverAddress, resolverMap map[string]int, seenIPs map[string]struct{}, ip string, port int) {
+	if _, exists := seenIPs[ip]; exists {
 		return
 	}
-	seenEndpoints[endpointKey] = struct{}{}
+	seenIPs[ip] = struct{}{}
 	if _, exists := resolverMap[ip]; !exists {
 		resolverMap[ip] = port
 	}
@@ -109,7 +108,7 @@ func addResolver(endpoints *[]ResolverAddress, resolverMap map[string]int, seenE
 	})
 }
 
-func appendPrefixResolvers(endpoints *[]ResolverAddress, resolverMap map[string]int, seenEndpoints map[string]struct{}, prefix netip.Prefix, port int) {
+func appendPrefixResolvers(endpoints *[]ResolverAddress, resolverMap map[string]int, seenIPs map[string]struct{}, prefix netip.Prefix, port int) {
 	prefix = prefix.Masked()
 	first, last := hostRange(prefix)
 	if !first.IsValid() || !last.IsValid() {
@@ -117,15 +116,11 @@ func appendPrefixResolvers(endpoints *[]ResolverAddress, resolverMap map[string]
 	}
 
 	for addr := first; ; addr = addr.Next() {
-		addResolver(endpoints, resolverMap, seenEndpoints, addr.String(), port)
+		addResolver(endpoints, resolverMap, seenIPs, addr.String(), port)
 		if addr == last {
 			return
 		}
 	}
-}
-
-func makeResolverEndpointKey(ip string, port int) string {
-	return ip + "|" + strconv.Itoa(port)
 }
 
 func parseResolverEntry(line string) (resolverTarget, int, error) {

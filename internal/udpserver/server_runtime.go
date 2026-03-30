@@ -57,12 +57,14 @@ func (s *Server) sessionCleanupLoop(ctx context.Context) {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
+	recentlyClosedSweepInterval := 5 * time.Minute
 	sessionTimeout := s.cfg.SessionTimeout()
 	closedRetention := s.cfg.ClosedSessionRetention()
 	invalidCookieWindow := s.invalidCookieWindow
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	lastRecentlyClosedSweep := time.Time{}
 
 	for {
 		select {
@@ -70,10 +72,18 @@ func (s *Server) sessionCleanupLoop(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			expired := s.sessions.Cleanup(now, sessionTimeout, closedRetention)
+			idleDeferred := s.sessions.CollectIdleDeferredSessions(now, s.deferredIdleCleanupTimeout(interval, sessionTimeout))
 			s.sessions.SweepTerminalStreams(now, s.cfg.TerminalStreamRetention())
+			if lastRecentlyClosedSweep.IsZero() || now.Sub(lastRecentlyClosedSweep) >= recentlyClosedSweepInterval {
+				s.sessions.SweepRecentlyClosedStreams(now)
+				lastRecentlyClosedSweep = now
+			}
 			s.invalidCookieTracker.Cleanup(now, invalidCookieWindow)
 			s.purgeDNSQueryFragments(now)
 			s.purgeSOCKS5SynFragments(now)
+			for _, idleSession := range idleDeferred {
+				s.cleanupIdleDeferredSession(idleSession.ID, idleSession.lastActivityNano, now)
+			}
 			if len(expired) == 0 {
 				continue
 			}
@@ -86,6 +96,21 @@ func (s *Server) sessionCleanupLoop(ctx context.Context) {
 			)
 		}
 	}
+}
+
+func (s *Server) deferredIdleCleanupTimeout(cleanupInterval time.Duration, sessionTimeout time.Duration) time.Duration {
+	timeout := s.deferredConnectAttemptTimeout()
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	if cleanupInterval <= 0 {
+		cleanupInterval = 30 * time.Second
+	}
+	idle := timeout + cleanupInterval
+	if sessionTimeout > 0 && sessionTimeout < idle {
+		return sessionTimeout
+	}
+	return idle
 }
 
 func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- request, readerID int) error {

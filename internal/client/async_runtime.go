@@ -11,6 +11,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -21,10 +22,13 @@ import (
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
 )
 
+const clientRXDropLogInterval = 2 * time.Second
+
 type asyncPacket struct {
 	conn       Connection
 	payload    []byte
 	packetType uint8
+	streamID   uint16
 }
 
 type asyncReadPacket struct {
@@ -37,6 +41,7 @@ type asyncReadPacket struct {
 func (c *Client) StopAsyncRuntime() {
 	if c.asyncCancel != nil {
 		c.log.Debugf("\U0001F6D1 <yellow>Stopping Async Runtime...</yellow>")
+		c.CloseAllStreams()
 		c.asyncCancel()
 		c.asyncWG.Wait()
 		c.asyncCancel = nil
@@ -76,6 +81,7 @@ func (c *Client) resetRuntimeBindings(resetSession bool) {
 	c.streamsMu.Lock()
 	c.last_stream_id = 0
 	c.streamsMu.Unlock()
+	c.bumpStreamSetVersion()
 
 	c.dnsResponses = fragmentStore.New[dnsFragmentKey](c.cfg.DNSResponseFragmentStoreCap)
 	if c.localDNSCache != nil {
@@ -84,6 +90,7 @@ func (c *Client) resetRuntimeBindings(resetSession bool) {
 
 	c.closeResolverConnPools()
 	c.clearTxSignal()
+	c.clearTxSpaceSignal()
 	c.clearSessionResetPending()
 	if resetSession {
 		c.resetSessionState(true)
@@ -101,6 +108,70 @@ func (c *Client) clearTxSignal() {
 			return
 		}
 	}
+}
+
+func (c *Client) clearTxSpaceSignal() {
+	if c == nil || c.txSpaceSignal == nil {
+		return
+	}
+	for {
+		select {
+		case <-c.txSpaceSignal:
+		default:
+			return
+		}
+	}
+}
+
+func (c *Client) signalTxSpace() {
+	if c == nil || c.txSpaceSignal == nil {
+		return
+	}
+	select {
+	case c.txSpaceSignal <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) txChannelHasCapacity(needed int) bool {
+	if c == nil || c.txChannel == nil {
+		return false
+	}
+	if needed <= 0 {
+		needed = 1
+	}
+	return cap(c.txChannel)-len(c.txChannel) >= needed
+}
+
+func (c *Client) onRXDrop(addr *net.UDPAddr) {
+	if c == nil {
+		return
+	}
+
+	total := c.rxDroppedPackets.Add(1)
+	now := time.Now().UnixNano()
+	last := c.lastRXDropLogUnix.Load()
+	if now-last < clientRXDropLogInterval.Nanoseconds() {
+		return
+	}
+	if !c.lastRXDropLogUnix.CompareAndSwap(last, now) {
+		return
+	}
+
+	queueLen := 0
+	queueCap := 0
+	if c.rxChannel != nil {
+		queueLen = len(c.rxChannel)
+		queueCap = cap(c.rxChannel)
+	}
+
+	c.log.Warnf(
+		"🚨 <yellow>RX queue overloaded</yellow> <magenta>|</magenta> <blue>Dropped</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Remote</blue>: <cyan>%v</cyan> <magenta>|</magenta> <blue>Queue</blue>: <cyan>%d/%d</cyan>",
+		total,
+		addr,
+		queueLen,
+		queueCap,
+	)
 }
 
 func (c *Client) resetSessionState(resetSessionCookie bool) {
@@ -247,6 +318,8 @@ func (c *Client) asyncStreamCleanupWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			c.cleanupRecentlyClosedStreams(now)
+
 			c.streamsMu.RLock()
 			streams := make([]*Stream_client, 0, len(c.active_streams))
 			for _, s := range c.active_streams {
@@ -335,18 +408,28 @@ drainRX:
 func (c *Client) asyncWriterWorker(ctx context.Context, id int, conn *net.UDPConn) {
 	defer c.asyncWG.Done()
 	c.log.Debugf("\U0001F680 <green>Writer Worker <cyan>#%d</cyan> started</green>", id)
+	var lastDeadline time.Time
+	refreshWindow := c.tunnelPacketTimeout / 2
+	if refreshWindow < 250*time.Millisecond {
+		refreshWindow = 250 * time.Millisecond
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case pkt := <-c.txChannel:
-			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", pkt.conn.Resolver, pkt.conn.ResolverPort))
+			c.signalTxSpace()
+			addr, err := c.getResolverUDPAddr(pkt.conn)
 			if err != nil {
 				continue
 			}
 
 			if c.tunnelPacketTimeout > 0 {
-				_ = conn.SetWriteDeadline(time.Now().Add(c.tunnelPacketTimeout))
+				now := time.Now()
+				if lastDeadline.IsZero() || now.Add(refreshWindow).After(lastDeadline) {
+					lastDeadline = now.Add(c.tunnelPacketTimeout)
+					_ = conn.SetWriteDeadline(lastDeadline)
+				}
 			}
 
 			sentAt := time.Now()
@@ -396,6 +479,7 @@ func (c *Client) asyncReaderWorker(ctx context.Context, id int, conn *net.UDPCon
 			default:
 				// Queue full! Drop packet and RECYCLE buffer.
 				c.udpBufferPool.Put(buf)
+				c.onRXDrop(addr)
 			}
 		}
 	}
@@ -425,9 +509,26 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr) {
 	// 1. Extract VPN Packet from DNS Response
 	vpnPacket, err := DnsParser.ExtractVPNResponse(data, c.responseMode == mtuProbeBase64Reply)
 	if err != nil {
+		if errors.Is(err, DnsParser.ErrTXTAnswerMissing) {
+			receivedAt := time.Now()
+			// summary := DnsParser.DescribeResponseWithoutTunnelPayload(data)
+			if parsed, parseErr := DnsParser.ParsePacketLite(data); parseErr == nil && parsed.Header.RCode != 0 {
+				c.trackResolverFailure(data, addr, receivedAt)
+			} else {
+				c.trackResolverSuccess(data, addr, receivedAt)
+			}
+			// c.log.Debugf("DNS response from %v had no tunnel TXT payload | %s", addr, summary)
+			return
+		}
+		// c.log.Debugf("\U0001F6A8 <red>Failed to parse VPN packet from DNS response: %v from %v</red>", err, addr)
 		return
 	}
 
+	// packedSummary := ""
+	// if vpnPacket.PacketType == Enums.PACKET_PACKED_CONTROL_BLOCKS {
+	// 	packedSummary = " | " + VpnProto.DescribePackedControlBlocks(vpnPacket.Payload, 4)
+	// }
+	// c.logInboundPacket(vpnPacket.PacketType, vpnPacket.SessionID, len(vpnPacket.Payload), vpnPacket.StreamID, vpnPacket.SequenceNum, vpnPacket.FragmentID, vpnPacket.TotalFragments, packedSummary)
 	c.trackResolverSuccess(data, addr, time.Now())
 
 	// 2. Notify activity monitor (PingManager)

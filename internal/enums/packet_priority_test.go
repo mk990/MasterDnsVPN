@@ -13,10 +13,11 @@ func TestDefaultPacketPriorityMatchesCurrentBehavior(t *testing.T) {
 	tests := map[uint8]int{
 		PACKET_STREAM_DATA:             PacketPriorityNormal,
 		PACKET_STREAM_DATA_ACK:         PacketPriorityCritical,
+		PACKET_STREAM_DATA_NACK:        PacketPriorityCritical,
 		PACKET_STREAM_RESEND:           PacketPriorityRetry,
 		PACKET_DNS_QUERY_REQ:           PacketPriorityRetry,
 		PACKET_SOCKS5_SYN:              PacketPriorityCritical,
-		PACKET_STREAM_FIN:              PacketPriorityLow,
+		PACKET_STREAM_CLOSE_WRITE:      PacketPriorityLow,
 		PACKET_STREAM_RST:              PacketPriorityCritical,
 		PACKET_PING:                    PacketPriorityIdle,
 		PACKET_SOCKS5_CONNECTED_ACK:    PacketPriorityCritical,

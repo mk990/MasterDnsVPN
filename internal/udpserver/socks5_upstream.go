@@ -8,6 +8,7 @@
 package udpserver
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	Enums "masterdnsvpn-go/internal/enums"
+	"masterdnsvpn-go/internal/logger"
 )
 
 type upstreamSOCKS5Error struct {
@@ -61,6 +63,10 @@ func (e *blockedSOCKSTargetError) Error() string {
 }
 
 func (s *Server) dialSOCKSStreamTarget(host string, port uint16, targetPayload []byte) (net.Conn, error) {
+	return s.dialSOCKSStreamTargetContext(context.Background(), host, port, targetPayload)
+}
+
+func (s *Server) dialSOCKSStreamTargetContext(ctx context.Context, host string, port uint16, targetPayload []byte) (net.Conn, error) {
 	if s == nil {
 		return nil, &upstreamSOCKS5Error{
 			packetType: Enums.PACKET_SOCKS5_UPSTREAM_UNAVAILABLE,
@@ -73,9 +79,9 @@ func (s *Server) dialSOCKSStreamTarget(host string, port uint16, targetPayload [
 	}
 
 	if !s.useExternalSOCKS5 || len(targetPayload) == 0 {
-		return s.dialTCPTarget(net.JoinHostPort(host, strconv.Itoa(int(port))))
+		return s.dialTCPTargetContext(ctx, net.JoinHostPort(host, strconv.Itoa(int(port))))
 	}
-	return s.dialExternalSOCKS5Target(targetPayload)
+	return s.dialExternalSOCKS5TargetContext(ctx, targetPayload)
 }
 
 func validateSOCKSTargetHost(host string) error {
@@ -117,23 +123,78 @@ func validateSOCKSTargetHost(host string) error {
 }
 
 func (s *Server) dialTCPTarget(address string) (net.Conn, error) {
+	return s.dialTCPTargetContext(context.Background(), address)
+}
+
+func (s *Server) dialTCPTargetContext(ctx context.Context, address string) (net.Conn, error) {
 	dialFn := s.dialStreamUpstreamFn
-	if dialFn == nil {
-		dialFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
-			return net.DialTimeout(network, address, timeout)
-		}
-	}
 	timeout := s.socksConnectTimeout
 	if timeout <= 0 {
 		timeout = s.cfg.SOCKSConnectTimeout()
 	}
-	return dialFn("tcp", address, timeout)
+	if deadline, ok := ctx.Deadline(); ok {
+		untilDeadline := time.Until(deadline)
+		if untilDeadline > 0 && (timeout <= 0 || untilDeadline < timeout) {
+			timeout = untilDeadline
+		}
+	}
+	startedAt := logger.NowUnixNano()
+
+	if dialFn == nil {
+		dialer := net.Dialer{Timeout: timeout}
+		conn, err := dialer.DialContext(ctx, "tcp", address)
+		return conn, err
+	}
+	if ctx == nil {
+		conn, err := dialFn("tcp", address, timeout)
+		return conn, err
+	}
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialFn("tcp", address, timeout)
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		go func() {
+			result := <-resultCh
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		if s != nil && s.log != nil {
+			s.log.Debugf(
+				"DEFER upstream-connect-finish | address=%s | dur_ms=%d | err=%v",
+				address,
+				(logger.NowUnixNano()-startedAt)/1_000_000,
+				result.err,
+			)
+		}
+		return result.conn, result.err
+	}
 }
 
 func (s *Server) dialExternalSOCKS5Target(targetPayload []byte) (net.Conn, error) {
-	conn, err := s.dialTCPTarget(s.externalSOCKS5Address)
+	return s.dialExternalSOCKS5TargetContext(context.Background(), targetPayload)
+}
+
+func (s *Server) dialExternalSOCKS5TargetContext(ctx context.Context, targetPayload []byte) (net.Conn, error) {
+	conn, err := s.dialTCPTargetContext(ctx, s.externalSOCKS5Address)
 	if err != nil {
 		return nil, err
+	}
+
+	if ctx != nil {
+		go func(c net.Conn) {
+			<-ctx.Done()
+			_ = c.Close()
+		}(conn)
 	}
 
 	timeout := s.socksConnectTimeout
@@ -150,6 +211,7 @@ func (s *Server) dialExternalSOCKS5Target(targetPayload []byte) (net.Conn, error
 	}
 
 	var greeting [2]byte
+
 	if _, err := io.ReadFull(conn, greeting[:]); err != nil {
 		_ = conn.Close()
 		return nil, &upstreamSOCKS5Error{packetType: Enums.PACKET_SOCKS5_UPSTREAM_UNAVAILABLE, err: err}
@@ -171,12 +233,14 @@ func (s *Server) dialExternalSOCKS5Target(targetPayload []byte) (net.Conn, error
 	request[1] = 0x01
 	request[2] = 0x00
 	copy(request[3:], targetPayload)
+
 	if err := writeAll(conn, request); err != nil {
 		_ = conn.Close()
 		return nil, &upstreamSOCKS5Error{packetType: Enums.PACKET_SOCKS5_UPSTREAM_UNAVAILABLE, err: err}
 	}
 
 	var header [4]byte
+
 	if _, err := io.ReadFull(conn, header[:]); err != nil {
 		_ = conn.Close()
 		return nil, &upstreamSOCKS5Error{packetType: Enums.PACKET_SOCKS5_UPSTREAM_UNAVAILABLE, err: err}

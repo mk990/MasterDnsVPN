@@ -43,18 +43,18 @@ UDP_PORT = 53
 
 # Number of UDP reader goroutines.
 # If <= 0, code falls back to an auto default.
-UDP_READERS = 4
+UDP_READERS = 2
 
 # Number of DNS request workers that process incoming packets.
 # If <= 0, code falls back to an auto default.
-DNS_REQUEST_WORKERS = 24
+DNS_REQUEST_WORKERS = 4
 
 # Maximum queued requests waiting behind request workers.
 # If the queue is full, packets are dropped and rate-limited overload logs appear.
-MAX_CONCURRENT_REQUESTS = 32768
+MAX_CONCURRENT_REQUESTS = 4096
 
 # UDP socket read/write buffer size in bytes.
-SOCKET_BUFFER_SIZE = 8388608
+SOCKET_BUFFER_SIZE = 4194304
 
 # Maximum packet buffer size allocated by the server packet pool.
 MAX_PACKET_SIZE = 65535
@@ -71,10 +71,10 @@ DROP_LOG_INTERVAL_SECONDS = 2.0
 
 # Worker count for deferred per-session processing.
 # These workers serialize heavy or ordering-sensitive tasks behind session keys.
-DEFERRED_SESSION_WORKERS = 12
+DEFERRED_SESSION_WORKERS = 2
 
 # Queue limit for deferred per-session work.
-DEFERRED_SESSION_QUEUE_LIMIT = 8192
+DEFERRED_SESSION_QUEUE_LIMIT = 2048
 
 # Initial queue / store capacities.
 SESSION_ORPHAN_QUEUE_INITIAL_CAPACITY = 128
@@ -200,11 +200,11 @@ ENCRYPTION_KEY_FILE = "encrypt_key.txt"
 # ------------------------------------------------------------------------------
 
 # Maximum packable control blocks emitted in one response.
-MAX_PACKETS_PER_BATCH = 20
+MAX_PACKETS_PER_BATCH = 10
 
 # Duplicate the last packed control-block response this many dispatcher turns.
 # 1 = disabled.
-# Useful on lossy links so FIN/RST/SYN-ACK-style control blocks are repeated
+# Useful on lossy links so CLOSE/RST/SYN-ACK-style control blocks are repeated
 # without repopping queues.
 PACKET_BLOCK_CONTROL_DUPLICATION = 1
 
@@ -215,15 +215,25 @@ STREAM_FAILURE_PACKET_TTL_SECONDS = 120.0
 
 # ARQ timing / retry profile.
 ARQ_WINDOW_SIZE = 600
-ARQ_INITIAL_RTO_SECONDS = 0.5
-ARQ_MAX_RTO_SECONDS = 3.0
-ARQ_CONTROL_INITIAL_RTO_SECONDS = 0.4
-ARQ_CONTROL_MAX_RTO_SECONDS = 2.0
+ARQ_INITIAL_RTO_SECONDS = 1
+ARQ_MAX_RTO_SECONDS = 5.0
+ARQ_CONTROL_INITIAL_RTO_SECONDS = 0.5
+ARQ_CONTROL_MAX_RTO_SECONDS = 3.0
 ARQ_MAX_CONTROL_RETRIES = 300
 ARQ_INACTIVITY_TIMEOUT_SECONDS = 1800.0
 ARQ_DATA_PACKET_TTL_SECONDS = 2400.0
 ARQ_CONTROL_PACKET_TTL_SECONDS = 1200.0
 ARQ_MAX_DATA_RETRIES = 1200
+
+# Maximum out-of-order gap ahead of rcvNxt that can trigger STREAM_DATA_NACK.
+# 0 disables NACK generation entirely.
+# Keep this small so only near-miss gaps cause early resend requests.
+ARQ_DATA_NACK_MAX_GAP = 64
+
+# Minimum seconds between repeated NACKs for the same missing sequence number.
+# Clamped to [0.1s, 30s].
+ARQ_DATA_NACK_REPEAT_SECONDS = 0.5
+
 ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS = 120.0
 ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS = 90.0
 
@@ -239,4 +249,3 @@ LOG_LEVEL = "INFO"
 # ------------------------------------------------------------------------------
 
 CONFIG_VERSION = "10"
-

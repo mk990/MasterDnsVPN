@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -24,6 +25,12 @@ import (
 	"masterdnsvpn-go/internal/version"
 )
 
+func waitForExitInput() {
+	_, _ = fmt.Fprint(os.Stderr, "Press Enter to exit...")
+	reader := bufio.NewReader(os.Stdin)
+	_, _ = reader.ReadString('\n')
+}
+
 func main() {
 	configPath := flag.String("config", "server_config.toml", "Path to server configuration file")
 	logPath := flag.String("log", "", "Path to log file (optional)")
@@ -40,6 +47,7 @@ func main() {
 	cfg, err := config.LoadServerConfig(resolvedConfigPath)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Server startup failed: %v\n", err)
+		waitForExitInput()
 		os.Exit(1)
 	}
 
@@ -61,16 +69,14 @@ func main() {
 	keyInfo, err := security.EnsureServerEncryptionKey(cfg)
 	if err != nil {
 		log.Errorf("\u274C <red>Encryption Key Setup Failed</red> <magenta>|</magenta> <cyan>%v</cyan>", err)
-		fmt.Print("Press Enter to exit...")
-		_, _ = fmt.Scanln()
+		waitForExitInput()
 		os.Exit(1)
 	}
 
 	codec, err := security.NewCodecFromConfig(cfg, keyInfo.Key)
 	if err != nil {
 		log.Errorf("\u274C <red>Encryption Codec Setup Failed</red> <magenta>|</magenta> <cyan>%v</cyan>", err)
-		fmt.Print("Press Enter to exit...")
-		_, _ = fmt.Scanln()
+		waitForExitInput()
 		os.Exit(1)
 	}
 
@@ -88,8 +94,7 @@ func main() {
 		)
 	} else {
 		log.Errorf("\u26A0\uFE0F <yellow>No Allowed Domains Configured!</yellow>")
-		fmt.Print("Press Enter to exit...")
-		_, _ = fmt.Scanln()
+		waitForExitInput()
 		os.Exit(1)
 	}
 

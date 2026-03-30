@@ -10,6 +10,7 @@ package mlq
 import (
 	"math/bits"
 	"sync"
+	"sync/atomic"
 )
 
 // PriorityQueue represents a single level of priority in the MLQ.
@@ -24,10 +25,13 @@ type MultiLevelQueue[T any] struct {
 
 	queues  [6]PriorityQueue[T]
 	bitmask uint16 // Bit i is 1 if queues[i] is not empty
+	fastSize atomic.Int32
 
 	// Global census for O(1) existence and duplicate prevention across all levels
 	census map[uint64]T
 }
+
+const compactThreshold = 1024
 
 // New creates a new MultiLevelQueue with an initial census capacity.
 func New[T any](initialCapacity int) *MultiLevelQueue[T] {
@@ -61,6 +65,7 @@ func (m *MultiLevelQueue[T]) Push(priority int, key uint64, item T) bool {
 	// 3. Update census and bitmask
 	m.census[key] = item
 	m.bitmask |= (1 << uint(priority))
+	m.fastSize.Add(1)
 
 	return true
 }
@@ -71,6 +76,29 @@ func (m *MultiLevelQueue[T]) Pop(keyExtractor func(T) uint64) (T, int, bool) {
 	defer m.mu.Unlock()
 
 	return m.popLocked(keyExtractor)
+}
+
+// Peek returns the highest-priority queued item without removing it.
+func (m *MultiLevelQueue[T]) Peek() (T, int, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var zero T
+	if m.bitmask == 0 {
+		return zero, 0, false
+	}
+
+	tempMask := m.bitmask
+	for tempMask != 0 {
+		priority := bits.TrailingZeros16(tempMask)
+		q := &m.queues[priority]
+		if len(q.Items) > 0 {
+			return q.Items[0], priority, true
+		}
+		tempMask &= ^(1 << uint(priority))
+	}
+
+	return zero, 0, false
 }
 
 func (m *MultiLevelQueue[T]) popLocked(keyExtractor func(T) uint64) (T, int, bool) {
@@ -90,11 +118,13 @@ func (m *MultiLevelQueue[T]) popLocked(keyExtractor func(T) uint64) (T, int, boo
 		// Memory safety: Clear the pointer from the slice to avoid leaks if T is a pointer
 		q.Items[0] = zero
 		q.Items = q.Items[1:]
+		maybeCompactQueue(q)
 
 		// Update census and bitmask
 		if keyExtractor != nil {
 			delete(m.census, keyExtractor(item))
 		}
+		m.fastSize.Add(-1)
 
 		if len(q.Items) == 0 {
 			m.bitmask &= ^(1 << uint(priority))
@@ -104,6 +134,18 @@ func (m *MultiLevelQueue[T]) popLocked(keyExtractor func(T) uint64) (T, int, boo
 	}
 
 	return zero, 0, false
+}
+
+func maybeCompactQueue[T any](q *PriorityQueue[T]) {
+	if q == nil {
+		return
+	}
+	if cap(q.Items) <= compactThreshold || len(q.Items) >= cap(q.Items)/4 {
+		return
+	}
+	compacted := make([]T, len(q.Items))
+	copy(compacted, q.Items)
+	q.Items = compacted
 }
 
 // Get checks if an item exists in the queue using its tracking key.
@@ -145,8 +187,10 @@ func (m *MultiLevelQueue[T]) RemoveByKey(key uint64, keyExtractor func(T) uint64
 			last := len(q.Items) - 1
 			q.Items[last] = zero
 			q.Items = q.Items[:last]
+			maybeCompactQueue(q)
 
 			delete(m.census, key)
+			m.fastSize.Add(-1)
 			if len(q.Items) == 0 {
 				m.bitmask &= ^(1 << uint(priority))
 			}
@@ -178,6 +222,14 @@ func (m *MultiLevelQueue[T]) Size() int {
 	return len(m.census)
 }
 
+// FastSize returns the exact queued item count using an atomic fast-path.
+func (m *MultiLevelQueue[T]) FastSize() int {
+	if m == nil {
+		return 0
+	}
+	return int(m.fastSize.Load())
+}
+
 // Clear empties all queues and reset the bitmask.
 // If a callback is provided, it is invoked for each item before clearing.
 func (m *MultiLevelQueue[T]) Clear(callback func(T)) {
@@ -195,6 +247,7 @@ func (m *MultiLevelQueue[T]) Clear(callback func(T)) {
 	}
 	clear(m.census)
 	m.bitmask = 0
+	m.fastSize.Store(0)
 }
 
 // HighestPriority returns the highest priority level currently containing items, or -1 if empty.
@@ -235,10 +288,12 @@ func (m *MultiLevelQueue[T]) PopIf(priority int, predicate func(T) bool, keyExtr
 	// Allowed to pop!
 	q.Items[0] = zero // Memory safety
 	q.Items = q.Items[1:]
+	maybeCompactQueue(q)
 
 	if keyExtractor != nil {
 		delete(m.census, keyExtractor(item))
 	}
+	m.fastSize.Add(-1)
 	if len(q.Items) == 0 {
 		m.bitmask &= ^(1 << uint(priority))
 	}
@@ -246,7 +301,8 @@ func (m *MultiLevelQueue[T]) PopIf(priority int, predicate func(T) bool, keyExtr
 }
 
 // PopAnyIf retrieves the highest priority item that matches the given predicate, regardless of its priority.
-func (m *MultiLevelQueue[T]) PopAnyIf(predicate func(T) bool, keyExtractor func(T) uint64) (T, bool) {
+// To avoid scanning lower-priority elements (e.g. data packets when searching for control packets), use maxPriority.
+func (m *MultiLevelQueue[T]) PopAnyIf(maxPriority int, predicate func(T) bool, keyExtractor func(T) uint64) (T, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -259,6 +315,9 @@ func (m *MultiLevelQueue[T]) PopAnyIf(predicate func(T) bool, keyExtractor func(
 	tempMask := m.bitmask
 	for tempMask != 0 {
 		priority := bits.TrailingZeros16(tempMask)
+		if priority > maxPriority { // priority < 0 not possible
+			break
+		}
 		q := &m.queues[priority]
 
 		if len(q.Items) > 0 {
@@ -273,10 +332,12 @@ func (m *MultiLevelQueue[T]) PopAnyIf(predicate func(T) bool, keyExtractor func(
 					last := len(q.Items) - 1
 					q.Items[last] = zero
 					q.Items = q.Items[:last]
+					maybeCompactQueue(q)
 
 					if keyExtractor != nil {
 						delete(m.census, keyExtractor(item))
 					}
+					m.fastSize.Add(-1)
 					if len(q.Items) == 0 {
 						m.bitmask &= ^(1 << uint(priority))
 					}

@@ -83,7 +83,7 @@ func (c *Client) handleStreamConnected(packet VpnProto.Packet, s *Stream_client,
 	}
 
 	if s.StatusValue() == streamStatusCancelled || !c.streamResultAllowed(s) {
-		arqObj.Close("late STREAM_CONNECTED result", arq.CloseOptions{Force: true})
+		arqObj.Close("late STREAM_CONNECTED result", arq.CloseOptions{SendRST: true})
 		return nil
 	}
 
@@ -104,7 +104,7 @@ func (c *Client) handleStreamConnectFail(_ VpnProto.Packet, s *Stream_client, ar
 	}
 
 	if s.StatusValue() == streamStatusCancelled || !c.streamResultAllowed(s) {
-		arqObj.Close("late STREAM_CONNECT_FAIL result", arq.CloseOptions{Force: true})
+		arqObj.Close("late STREAM_CONNECT_FAIL result", arq.CloseOptions{SendRST: true})
 		return nil
 	}
 

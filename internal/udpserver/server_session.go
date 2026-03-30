@@ -8,8 +8,9 @@
 package udpserver
 
 import (
+	"context"
 	"encoding/binary"
-	"sort"
+	"fmt"
 	"time"
 
 	"masterdnsvpn-go/internal/arq"
@@ -92,6 +93,11 @@ func (s *Server) logInvalidSessionDrop(reason string, sessionID uint8, receivedC
 	if !s.debugLoggingEnabled() {
 		return
 	}
+	now := time.Now()
+	logKey, interval := invalidSessionDropLogConfig(reason, sessionID, receivedCookie, expectedCookie, responseMode)
+	if !s.invalidSessionDropLog.allow(logKey, now, interval) {
+		return
+	}
 	if expectedCookie == 0 {
 		s.log.Debugf(
 			"\U0001F44B <yellow>Sending Session Drop</yellow> <magenta>|</magenta> <blue>Reason</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Received</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Mode</blue>: <cyan>%s</cyan>",
@@ -110,6 +116,19 @@ func (s *Server) logInvalidSessionDrop(reason string, sessionID uint8, receivedC
 		receivedCookie,
 		sessionResponseModeName(responseMode),
 	)
+}
+
+func invalidSessionDropLogConfig(reason string, sessionID uint8, receivedCookie uint8, expectedCookie uint8, responseMode uint8) (string, time.Duration) {
+	switch reason {
+	case "recently closed session":
+		return fmt.Sprintf("recently-closed:%d:%d:%d", sessionID, expectedCookie, responseMode), 3 * time.Second
+	case "invalid cookie threshold":
+		return fmt.Sprintf("invalid-cookie:%d:%d:%d", sessionID, expectedCookie, responseMode), 1500 * time.Millisecond
+	case "unknown session":
+		return fmt.Sprintf("unknown-session:%d:%d", sessionID, responseMode), 1500 * time.Millisecond
+	default:
+		return fmt.Sprintf("%s:%d:%d:%d", reason, sessionID, expectedCookie, responseMode), time.Second
+	}
 }
 
 func (s *Server) buildInvalidSessionErrorResponse(questionPacket []byte, requestName string, sessionID uint8, responseMode uint8) []byte {
@@ -190,6 +209,8 @@ func (s *Server) streamARQConfig(compressionType uint8) arq.Config {
 		InactivityTimeout:        s.cfg.ARQInactivityTimeoutSeconds,
 		DataPacketTTL:            s.cfg.ARQDataPacketTTLSeconds,
 		MaxDataRetries:           s.cfg.ARQMaxDataRetries,
+		DataNackMaxGap:           s.cfg.ARQDataNackMaxGap,
+		DataNackRepeatSeconds:    s.cfg.ARQDataNackRepeatSeconds,
 		ControlPacketTTL:         s.cfg.ARQControlPacketTTLSeconds,
 		TerminalDrainTimeout:     s.cfg.ARQTerminalDrainTimeoutSec,
 		TerminalAckWaitTimeout:   s.cfg.ARQTerminalAckWaitTimeoutSec,
@@ -206,11 +227,51 @@ func (s *Server) cleanupClosedSession(sessionID uint8, record *sessionRecord) {
 	if s == nil || sessionID == 0 {
 		return
 	}
+	s.clearDeferredPacketsForSession(sessionID)
+	s.removeSOCKS5SynFragmentsForSession(sessionID)
 	if record != nil {
 		record.closeAllStreams("session closed cleanup")
 	}
-	s.deferredSession.RemoveSession(sessionID)
+	s.cleanupDeferredSessionState(sessionID)
+}
+
+func (s *Server) cleanupDeferredSessionState(sessionID uint8) {
+	if s == nil || sessionID == 0 {
+		return
+	}
+	if s.deferredDNSSession != nil {
+		s.deferredDNSSession.RemoveSession(sessionID)
+	}
+	if s.deferredConnectSession != nil {
+		s.deferredConnectSession.RemoveSession(sessionID)
+	}
 	s.removeDNSQueryFragmentsForSession(sessionID)
+}
+
+func (s *Server) cleanupIdleDeferredSession(sessionID uint8, lastActivityNano int64, now time.Time) {
+	if s == nil || sessionID == 0 {
+		return
+	}
+
+	s.clearDeferredPacketsForSession(sessionID)
+	s.removeSOCKS5SynFragmentsForSession(sessionID)
+	s.cleanupDeferredSessionState(sessionID)
+}
+
+func (s *Server) cleanupStreamArtifacts(sessionID uint8, streamID uint16) {
+	if s == nil || sessionID == 0 || streamID == 0 {
+		return
+	}
+	s.clearDeferredPacketsForStream(sessionID, streamID)
+	s.removeSOCKS5SynFragmentsForStream(sessionID, streamID)
+}
+
+func (s *Server) finalizeStreamArtifacts(sessionID uint8, streamID uint16) {
+	if s == nil || sessionID == 0 || streamID == 0 {
+		return
+	}
+	s.finalizeDeferredPacketsForStream(sessionID, streamID)
+	s.removeSOCKS5SynFragmentsForStream(sessionID, streamID)
 }
 
 func (s *Server) serveQueuedOrPong(questionPacket []byte, requestName string, record *sessionRuntimeView, now time.Time) []byte {
@@ -237,40 +298,48 @@ func (s *Server) dequeueSessionResponse(sessionID uint8, now time.Time) (*VpnPro
 	}
 
 	record.mu.Lock()
-	defer record.mu.Unlock()
-
 	if pkt, ok := s.dequeueDuplicatedPackedControlBlock(record); ok {
+		record.mu.Unlock()
 		return pkt, true
 	}
+	rrStreamID := record.RRStreamID
+	record.mu.Unlock()
 
-	record.StreamsMu.RLock()
-	streamCount := len(record.ActiveStreams)
-	ids := make([]int32, 0, streamCount+1)
-	for _, id := range record.ActiveStreams {
-		ids = append(ids, int32(id))
+	readyIDs, readyStreams := record.readyStreamSnapshot()
+	hasOrphan := record.OrphanQueue != nil && record.OrphanQueue.FastSize() > 0
+	totalCandidates := len(readyIDs)
+	if hasOrphan {
+		totalCandidates++
 	}
-	record.StreamsMu.RUnlock()
-
-	if record.OrphanQueue != nil && record.OrphanQueue.Size() > 0 {
-		ids = append(ids, -1)
-	}
-	if len(ids) == 0 {
+	if totalCandidates == 0 {
 		return nil, false
 	}
 
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
 	startIdx := 0
-	for i, id := range ids {
-		if id >= record.RRStreamID {
+	candidateAt := func(idx int) (int32, *Stream_server) {
+		if hasOrphan {
+			if idx == 0 {
+				return -1, nil
+			}
+			idx--
+		}
+		if idx < 0 || idx >= len(readyIDs) {
+			return 0, nil
+		}
+		return readyIDs[idx], readyStreams[idx]
+	}
+
+	for i := 0; i < totalCandidates; i++ {
+		id, _ := candidateAt(i)
+		if id >= rrStreamID {
 			startIdx = i
 			break
 		}
 	}
 
-	for i := 0; i < len(ids); i++ {
-		idx := (startIdx + i) % len(ids)
-		id := ids[idx]
+	for i := 0; i < totalCandidates; i++ {
+		idx := (startIdx + i) % totalCandidates
+		id, stream := candidateAt(idx)
 
 		var item *serverStreamTXPacket
 		var ok bool
@@ -292,9 +361,6 @@ func (s *Server) dequeueSessionResponse(sessionID uint8, now time.Time) (*VpnPro
 				ok = true
 			}
 		} else {
-			record.StreamsMu.RLock()
-			stream := record.Streams[uint16(id)]
-			record.StreamsMu.RUnlock()
 			if stream == nil || stream.TXQueue == nil {
 				continue
 			}
@@ -304,23 +370,33 @@ func (s *Server) dequeueSessionResponse(sessionID uint8, now time.Time) (*VpnPro
 				continue
 			}
 			var popped *serverStreamTXPacket
-			popped, _, ok = stream.TXQueue.Pop(func(p *serverStreamTXPacket) uint64 {
-				return Enums.PacketIdentityKey(uint16(id), p.PacketType, p.SequenceNum, p.FragmentID)
-			})
+			popped, _, ok = stream.PopNextTXPacket()
 			if ok {
+				stream.NoteTXPacketDequeued(popped)
+				if (popped.PacketType == Enums.PACKET_STREAM_DATA || popped.PacketType == Enums.PACKET_STREAM_RESEND) &&
+					stream.ARQ != nil && !stream.ARQ.HasPendingSequence(popped.SequenceNum) {
+					putTXPacketToPool(popped)
+					continue
+				}
 				item = popped
 				selectedStreamID = uint16(id)
 			}
 		}
 
 		if ok && item != nil {
+			record.mu.Lock()
 			record.RRStreamID = id + 1
 			if VpnProto.IsPackableControlPacket(item.PacketType, len(item.Payload)) && record.MaxPackedBlocks > 1 {
 				pkt := s.packControlBlocks(record, item, id, selectedStreamID)
 				s.cachePackedControlBlockDuplicate(record, pkt)
+				record.mu.Unlock()
 				return pkt, true
 			}
+			record.mu.Unlock()
 			pkt := vpnPacketFromTX(item, selectedStreamID)
+			if id != -1 {
+				putTXPacketToPool(item)
+			}
 			return &pkt, true
 		}
 	}
@@ -377,67 +453,114 @@ func (s *Server) packControlBlocks(record *sessionRecord, first *serverStreamTXP
 	payload = VpnProto.AppendPackedControlBlock(payload, first.PacketType, initialStreamID, first.SequenceNum, first.FragmentID, first.TotalFragments)
 	blocks := 1
 
-	record.StreamsMu.RLock()
-	ids := make([]int32, 0, len(record.ActiveStreams)+1)
-	if record.OrphanQueue != nil && record.OrphanQueue.Size() > 0 {
-		ids = append(ids, -1)
-	}
-	for _, sid := range record.ActiveStreams {
-		ids = append(ids, int32(sid))
-	}
-	record.StreamsMu.RUnlock()
+	readyIDs, readyStreams := record.readyStreamSnapshot()
+	hasOrphan := record.OrphanQueue != nil && record.OrphanQueue.FastSize() > 0
 
-	orderedIDs := make([]int32, 0, len(ids))
-	orderedIDs = append(orderedIDs, initialID)
-	for _, id := range ids {
-		if id != initialID {
-			orderedIDs = append(orderedIDs, id)
-		}
-	}
-
-	for _, id := range orderedIDs {
+	processID := func(id int32, stream *Stream_server) bool {
 		if blocks >= limit {
-			break
+			return true
 		}
 
 		if id == -1 {
 			for blocks < limit {
-				popped, ok := record.OrphanQueue.PopAnyIf(func(p VpnProto.Packet) bool {
+				if record.OrphanQueue == nil || record.OrphanQueue.FastSize() == 0 {
+					return false
+				}
+				popped, ok := record.OrphanQueue.PopAnyIf(2, func(p VpnProto.Packet) bool {
 					return VpnProto.IsPackableControlPacket(p.PacketType, 0)
 				}, func(p VpnProto.Packet) uint64 {
 					return Enums.PacketTypeStreamKey(p.StreamID, p.PacketType)
 				})
 				if !ok {
-					break
+					return false
 				}
 				payload = VpnProto.AppendPackedControlBlock(payload, popped.PacketType, popped.StreamID, popped.SequenceNum, popped.FragmentID, popped.TotalFragments)
 				blocks++
 			}
-		} else {
-			record.StreamsMu.RLock()
-			stream := record.Streams[uint16(id)]
-			record.StreamsMu.RUnlock()
-			if stream == nil || stream.TXQueue == nil {
-				continue
+			return false
+		}
+
+		if stream == nil || stream.TXQueue == nil {
+			return false
+		}
+
+		for blocks < limit {
+			if stream.FastTXQueueSize() == 0 {
+				return false
 			}
-			for blocks < limit {
-				popped, ok := stream.TXQueue.PopAnyIf(func(p *serverStreamTXPacket) bool {
-					return VpnProto.IsPackableControlPacket(p.PacketType, len(p.Payload))
-				}, func(p *serverStreamTXPacket) uint64 {
-					return Enums.PacketIdentityKey(uint16(id), p.PacketType, p.SequenceNum, p.FragmentID)
-				})
-				if !ok {
-					break
-				}
-				payload = VpnProto.AppendPackedControlBlock(payload, popped.PacketType, uint16(id), popped.SequenceNum, popped.FragmentID, popped.TotalFragments)
-				blocks++
+			popped, ok := stream.PopAnyTXPacket(2, func(p *serverStreamTXPacket) bool {
+				return VpnProto.IsPackableControlPacket(p.PacketType, len(p.Payload))
+			})
+			if !ok {
+				return false
+			}
+			stream.NoteTXPacketDequeued(popped)
+			payload = VpnProto.AppendPackedControlBlock(payload, popped.PacketType, uint16(id), popped.SequenceNum, popped.FragmentID, popped.TotalFragments)
+			blocks++
+			putTXPacketToPool(popped)
+		}
+		return false
+	}
+
+	var initialStream *Stream_server
+	var initialIndex int = -1
+	if initialID != -1 {
+		for i, id := range readyIDs {
+			if id == initialID {
+				initialIndex = i
+				initialStream = readyStreams[i]
+				break
+			}
+		}
+	}
+	if processID(initialID, initialStream) {
+		goto buildResult
+	}
+
+	if hasOrphan && initialID != -1 {
+		if processID(-1, nil) {
+			goto buildResult
+		}
+	}
+
+	if initialIndex >= 0 {
+		for i := initialIndex + 1; i < len(readyIDs); i++ {
+			if processID(readyIDs[i], readyStreams[i]) {
+				goto buildResult
+			}
+		}
+		for i := 0; i < initialIndex; i++ {
+			if processID(readyIDs[i], readyStreams[i]) {
+				goto buildResult
+			}
+		}
+	} else {
+		for i, id := range readyIDs {
+			if processID(id, readyStreams[i]) {
+				goto buildResult
 			}
 		}
 	}
 
+	if initialID == -1 && hasOrphan {
+		for i, id := range readyIDs {
+			if processID(id, readyStreams[i]) {
+				goto buildResult
+			}
+		}
+	}
+
+buildResult:
 	if blocks <= 1 {
 		pkt := vpnPacketFromTX(first, initialStreamID)
+		if initialID != -1 {
+			putTXPacketToPool(first)
+		}
 		return &pkt
+	}
+
+	if initialID != -1 {
+		putTXPacketToPool(first)
 	}
 
 	return &VpnProto.Packet{
@@ -516,20 +639,30 @@ func isDeferredPostSessionPacketType(packetType uint8) bool {
 	switch packetType {
 	case Enums.PACKET_DNS_QUERY_REQ,
 		Enums.PACKET_STREAM_SYN,
-		Enums.PACKET_SOCKS5_SYN,
-		Enums.PACKET_STREAM_DATA,
-		Enums.PACKET_STREAM_RESEND:
+		Enums.PACKET_SOCKS5_SYN:
 		return true
 	default:
 		return false
 	}
 }
 
-func (s *Server) dispatchDeferredSessionPacket(packet VpnProto.Packet, run func()) bool {
-	if s == nil || s.deferredSession == nil || !isDeferredPostSessionPacketType(packet.PacketType) {
+func (s *Server) dispatchDeferredSessionPacket(packet VpnProto.Packet, run func(context.Context)) bool {
+	if s == nil || !isDeferredPostSessionPacketType(packet.PacketType) {
 		return false
 	}
-	return s.deferredSession.Enqueue(deferredSessionLaneForPacket(packet), run)
+	var processor *deferredSessionProcessor
+	switch packet.PacketType {
+	case Enums.PACKET_DNS_QUERY_REQ:
+		processor = s.deferredDNSSession
+	case Enums.PACKET_STREAM_SYN, Enums.PACKET_SOCKS5_SYN:
+		processor = s.deferredConnectSession
+	default:
+		return false
+	}
+	if processor == nil {
+		return false
+	}
+	return processor.Enqueue(deferredSessionLaneForPacket(packet), run)
 }
 
 func isPreSessionRequestType(packetType uint8) bool {
@@ -574,6 +707,7 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 	if record == nil {
 		return nil
 	}
+	record.streamCleanup = s.cleanupStreamArtifacts
 
 	if !reused && s.log != nil {
 		s.log.Infof(

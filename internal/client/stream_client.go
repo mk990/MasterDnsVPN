@@ -62,12 +62,17 @@ type Stream_client struct {
 	ResolverResendStreak   int
 	LastResolverFailoverAt time.Time
 	HandshakeLastProgress  time.Time
+	CachedResolverPlan     []Connection
+	CachedResolverPlanFor  string
+	CachedResolverPlanSize int
+	CachedResolverVersion  uint64
 
 	resolverMu    sync.Mutex
 	txQueueMu     sync.Mutex
 	statusMu      sync.RWMutex
 	terminalSince time.Time
 	socksResultMu sync.Mutex
+	cleanupOnce   sync.Once
 }
 
 // get_new_stream_id finds the next available stream ID using a circular counter (1-65535).
@@ -144,10 +149,13 @@ func (c *Client) new_stream(streamID uint16, conn net.Conn, targetPayload []byte
 		InactivityTimeout:        c.cfg.ARQInactivityTimeoutSeconds,
 		DataPacketTTL:            c.cfg.ARQDataPacketTTLSeconds,
 		MaxDataRetries:           c.cfg.ARQMaxDataRetries,
+		DataNackMaxGap:           c.cfg.ARQDataNackMaxGap,
+		DataNackRepeatSeconds:    c.cfg.ARQDataNackRepeatSeconds,
 		ControlPacketTTL:         c.cfg.ARQControlPacketTTLSeconds,
 		TerminalDrainTimeout:     c.cfg.ARQTerminalDrainTimeoutSec,
 		TerminalAckWaitTimeout:   c.cfg.ARQTerminalAckWaitTimeoutSec,
 		CompressionType:          c.uploadCompression,
+		IsClient:                 true,
 	}
 
 	a := arq.NewARQ(streamID, c.sessionID, s, conn, mtu, c.log, arqCfg)
@@ -160,6 +168,7 @@ func (c *Client) new_stream(streamID uint16, conn net.Conn, targetPayload []byte
 	}
 	c.active_streams[streamID] = s
 	c.streamsMu.Unlock()
+	c.bumpStreamSetVersion()
 
 	if conn != nil && streamID != 0 {
 		switch c.cfg.ProtocolType {
@@ -187,7 +196,7 @@ func (s *Stream_client) PushTXPacket(priority int, packetType uint8, sequenceNum
 	priority = Enums.NormalizePacketPriority(packetType, priority)
 
 	// Skip Ping packets if the queue is already congested (prevent bloat)
-	if packetType == Enums.PACKET_PING && s.txQueue != nil && s.txQueue.Size() > 200 {
+	if packetType == Enums.PACKET_PING && s.txQueue != nil && s.txQueue.FastSize() > 200 {
 		return false
 	}
 
@@ -253,8 +262,20 @@ func (s *Stream_client) PopNextTXPacket() (*clientStreamTXPacket, int, bool) {
 	packet, priority, ok := s.txQueue.Pop(func(p *clientStreamTXPacket) uint64 {
 		return Enums.PacketIdentityKey(s.StreamID, p.PacketType, p.SequenceNum, p.FragmentID)
 	})
+	if ok && packet != nil {
+		s.NoteTXPacketDequeued(packet)
+	}
 
 	return packet, priority, ok
+}
+
+func (s *Stream_client) NoteTXPacketDequeued(packet *clientStreamTXPacket) {
+	if s == nil || packet == nil {
+		return
+	}
+	if a, ok := s.Stream.(*arq.ARQ); ok && a != nil {
+		a.NoteTXPacketDequeued(packet.PacketType, packet.SequenceNum, packet.FragmentID)
+	}
 }
 
 // GetQueuedPacket checks if a packet exists in any priority queue in O(1).
@@ -285,6 +306,26 @@ func (s *Stream_client) RemoveQueuedData(sequenceNum uint16) bool {
 	return removedAny
 }
 
+func (s *Stream_client) RemoveQueuedDataNack(sequenceNum uint16) bool {
+	if s == nil || s.txQueue == nil {
+		return false
+	}
+
+	s.txQueueMu.Lock()
+	defer s.txQueueMu.Unlock()
+
+	key := Enums.PacketIdentityKey(s.StreamID, Enums.PACKET_STREAM_DATA_NACK, sequenceNum, 0)
+	p, ok := s.txQueue.RemoveByKey(key, func(p *clientStreamTXPacket) uint64 {
+		return Enums.PacketIdentityKey(s.StreamID, p.PacketType, p.SequenceNum, p.FragmentID)
+	})
+	if !ok {
+		return false
+	}
+
+	s.ReleaseTXPacket(p)
+	return true
+}
+
 func (s *Stream_client) cleanupResources() {
 	if s.NetConn != nil {
 		_ = s.NetConn.Close()
@@ -300,6 +341,32 @@ func (s *Stream_client) cleanupResources() {
 	s.SetStatus(streamStatusClosed)
 }
 
+func (s *Stream_client) finalizeAfterARQClose() {
+	if s == nil {
+		return
+	}
+
+	s.cleanupOnce.Do(func() {
+		if s.client != nil {
+			s.client.streamsMu.Lock()
+			if current, ok := s.client.active_streams[s.StreamID]; ok && current == s {
+				delete(s.client.active_streams, s.StreamID)
+			}
+			s.client.streamsMu.Unlock()
+			s.client.bumpStreamSetVersion()
+		}
+
+		s.cleanupResources()
+	})
+}
+
+func (s *Stream_client) OnARQClosed(reason string) {
+	if s != nil && s.client != nil {
+		s.client.rememberClosedStream(s.StreamID, reason, time.Now())
+	}
+	s.finalizeAfterARQClose()
+}
+
 // Close gracefully shuts down the stream and releases all resources.
 func (s *Stream_client) Close() {
 	if s.Stream != nil {
@@ -307,7 +374,7 @@ func (s *Stream_client) Close() {
 			a.Close("Stream_client.Close cleanup", arq.CloseOptions{Force: true})
 		}
 	}
-	s.cleanupResources()
+	s.finalizeAfterARQClose()
 }
 
 func (s *Stream_client) CloseStream(force bool, ttl time.Duration) {
@@ -316,18 +383,28 @@ func (s *Stream_client) CloseStream(force bool, ttl time.Duration) {
 	}
 
 	if a, ok := s.Stream.(*arq.ARQ); ok && a != nil {
-		a.Close("Close stream requested", arq.CloseOptions{
-			Force:   force,
-			SendRST: !force,
-			TTL:     ttl,
-		})
 		if force {
-			s.cleanupResources()
+			s.MarkTerminal(time.Now())
+			s.SetStatus(streamStatusCancelled)
+			if s.NetConn != nil {
+				_ = s.NetConn.Close()
+			}
+			a.Close("Close stream requested", arq.CloseOptions{
+				SendRST: true,
+				TTL:     ttl,
+			})
+			return
 		}
+
+		a.Close("Close stream requested", arq.CloseOptions{
+			SendCloseRead: true,
+			AfterDrain:    true,
+			TTL:           ttl,
+		})
 		return
 	}
 
-	s.cleanupResources()
+	s.finalizeAfterARQClose()
 }
 
 // ReleaseTXPacket returns a packet to the pool.
@@ -392,11 +469,51 @@ func (s *Stream_client) TerminalSince() time.Time {
 // Virtual Stream 0 Support
 // -----------------------------------------------------------------------------------------
 
-type fakeConn struct{}
+type fakeConnTimeoutError struct{}
+
+func (fakeConnTimeoutError) Error() string   { return "fakeConn read timeout" }
+func (fakeConnTimeoutError) Timeout() bool   { return true }
+func (fakeConnTimeoutError) Temporary() bool { return true }
+
+type fakeConn struct {
+	mu           sync.Mutex
+	readDeadline time.Time
+	closedCh     chan struct{}
+	closeOnce    sync.Once
+}
 
 func (f *fakeConn) Read(b []byte) (n int, err error) {
-	// Block eternally so ARQ's ioLoop doesn't spin or immediately exit
-	select {}
+	for {
+		f.mu.Lock()
+		deadline := f.readDeadline
+		closedCh := f.closedCh
+		f.mu.Unlock()
+
+		if closedCh == nil {
+			return 0, net.ErrClosed
+		}
+
+		if deadline.IsZero() {
+			<-closedCh
+			return 0, net.ErrClosed
+		}
+
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return 0, fakeConnTimeoutError{}
+		}
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-closedCh:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return 0, net.ErrClosed
+		case <-timer.C:
+			return 0, fakeConnTimeoutError{}
+		}
+	}
 }
 
 func (f *fakeConn) Write(b []byte) (n int, err error) {
@@ -405,7 +522,33 @@ func (f *fakeConn) Write(b []byte) (n int, err error) {
 }
 
 func (f *fakeConn) Close() error {
+	f.closeOnce.Do(func() {
+		if f.closedCh != nil {
+			close(f.closedCh)
+		}
+	})
 	return nil
+}
+
+func (f *fakeConn) SetReadDeadline(deadline time.Time) error {
+	f.mu.Lock()
+	f.readDeadline = deadline
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+func (f *fakeConn) SetDeadline(deadline time.Time) error {
+	return f.SetReadDeadline(deadline)
+}
+
+func newFakeConn() *fakeConn {
+	return &fakeConn{
+		closedCh: make(chan struct{}),
+	}
 }
 
 // InitVirtualStream0 initializes Stream #0 instantly upon Session start.
@@ -439,22 +582,26 @@ func (c *Client) InitVirtualStream0() {
 		InactivityTimeout:        999999.0, // Infinite
 		DataPacketTTL:            999999.0,
 		MaxDataRetries:           99999,
+		DataNackMaxGap:           0,
+		DataNackRepeatSeconds:    c.cfg.ARQDataNackRepeatSeconds,
 		ControlPacketTTL:         999999.0,
 		TerminalDrainTimeout:     c.cfg.ARQTerminalDrainTimeoutSec,
 		TerminalAckWaitTimeout:   c.cfg.ARQTerminalAckWaitTimeoutSec,
 		CompressionType:          c.uploadCompression,
 	}
 
-	conn := &fakeConn{}
+	conn := newFakeConn()
 	a := arq.NewARQ(streamID, c.sessionID, s, conn, mtu, c.log, arqCfg)
 	s.Stream = a
 	c.active_streams[streamID] = s
 	a.Start()
+	c.bumpStreamSetVersion()
 
 	c.log.Debugf("🚀 <green>Virtual Stream 0 (Control Channel) Initialized.</green>")
 }
 
-// CloseAllStreams completely flushes all ARQ bindings. For Stream 0, it calls ForceClose.
+// CloseAllStreams is the hard-stop path used during runtime shutdown/reset.
+// It finalizes streams locally so retransmit loops stop immediately.
 func (c *Client) CloseAllStreams() {
 	c.streamsMu.Lock()
 	streams := make([]*Stream_client, 0, len(c.active_streams))
@@ -463,6 +610,7 @@ func (c *Client) CloseAllStreams() {
 	}
 	c.active_streams = make(map[uint16]*Stream_client)
 	c.streamsMu.Unlock()
+	c.bumpStreamSetVersion()
 
 	for _, s := range streams {
 		if s != nil {
@@ -470,5 +618,6 @@ func (c *Client) CloseAllStreams() {
 		}
 	}
 
+	c.clearRecentlyClosedStreams()
 	c.clearOrphanResets()
 }

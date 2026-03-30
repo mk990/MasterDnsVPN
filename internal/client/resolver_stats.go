@@ -114,6 +114,38 @@ func (c *Client) trackResolverSuccess(packet []byte, addr *net.UDPAddr, received
 	c.noteResolverSuccess(sample.serverKey, receivedAt.Sub(sample.sentAt))
 }
 
+func (c *Client) trackResolverFailure(packet []byte, addr *net.UDPAddr, failedAt time.Time) {
+	if c == nil || len(packet) < 2 || addr == nil {
+		return
+	}
+
+	key := resolverSampleKey{
+		resolverAddr: addr.String(),
+		dnsID:        binary.BigEndian.Uint16(packet[:2]),
+	}
+
+	c.resolverStatsMu.Lock()
+	timeoutObservations := c.pruneResolverSamplesLocked(failedAt)
+	sample, ok := c.resolverPending[key]
+	if ok {
+		delete(c.resolverPending, key)
+	}
+	c.resolverStatsMu.Unlock()
+
+	for _, observation := range timeoutObservations {
+		c.noteResolverTimeout(observation.serverKey, observation.at)
+	}
+
+	if !ok || sample.serverKey == "" {
+		return
+	}
+	if sample.timedOut {
+		return
+	}
+
+	c.recordResolverHealthEvent(sample.serverKey, false, failedAt)
+}
+
 func (c *Client) collectExpiredResolverTimeouts(now time.Time) {
 	if c == nil {
 		return

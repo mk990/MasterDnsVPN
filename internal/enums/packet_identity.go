@@ -16,6 +16,7 @@ func PacketIdentityKey(streamID uint16, packetType uint8, sequenceNum uint16, fr
 	case PACKET_STREAM_DATA,
 		PACKET_STREAM_RESEND,
 		PACKET_STREAM_DATA_ACK,
+		PACKET_STREAM_DATA_NACK,
 		PACKET_STREAM_SYN,
 		PACKET_STREAM_SYN_ACK,
 		PACKET_SOCKS5_SYN,
@@ -27,8 +28,10 @@ func PacketIdentityKey(streamID uint16, packetType uint8, sequenceNum uint16, fr
 		return packetIdentitySeqFrag(streamID, packetType, sequenceNum, fragmentID)
 
 	// Terminal / result packets are unique per stream+type+sequence.
-	case PACKET_STREAM_FIN,
-		PACKET_STREAM_FIN_ACK,
+	case PACKET_STREAM_CLOSE_WRITE,
+		PACKET_STREAM_CLOSE_WRITE_ACK,
+		PACKET_STREAM_CLOSE_READ,
+		PACKET_STREAM_CLOSE_READ_ACK,
 		PACKET_STREAM_RST,
 		PACKET_STREAM_RST_ACK,
 		PACKET_STREAM_CONNECTED,

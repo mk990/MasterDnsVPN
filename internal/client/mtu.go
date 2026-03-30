@@ -30,7 +30,7 @@ const (
 	mtuProbeCodeLength  = 4
 	mtuProbeRawResponse = 0
 	mtuProbeBase64Reply = 1
-	defaultMTUMinFloor  = 30
+	defaultMTUMinFloor  = 10
 	defaultUploadMaxCap = 512
 )
 

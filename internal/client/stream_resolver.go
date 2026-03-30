@@ -15,19 +15,27 @@ func (c *Client) runtimePacketDuplicationCount(packetType uint8) int {
 	if count < 1 {
 		count = 1
 	}
-	if packetType == Enums.PACKET_STREAM_SYN || packetType == Enums.PACKET_SOCKS5_SYN {
+
+	if packetType == Enums.PACKET_STREAM_SYN ||
+		packetType == Enums.PACKET_PACKED_CONTROL_BLOCKS ||
+		packetType == Enums.PACKET_SOCKS5_SYN ||
+		packetType == Enums.PACKET_STREAM_CLOSE_READ ||
+		packetType == Enums.PACKET_STREAM_CLOSE_WRITE {
 		if c.cfg.SetupPacketDuplicationCount > count {
 			count = c.cfg.SetupPacketDuplicationCount
 		}
 	}
+
 	return count
 }
 
 func (c *Client) selectTargetConnectionsForPacket(packetType uint8, streamID uint16) ([]Connection, error) {
 	targetCount := c.runtimePacketDuplicationCount(packetType)
+
 	if c == nil || c.balancer == nil || streamID == 0 || c.balancer.ValidCount() <= 0 {
 		return c.selectUniqueRuntimeConnections(targetCount)
 	}
+
 	if packetType != Enums.PACKET_STREAM_DATA && packetType != Enums.PACKET_STREAM_RESEND {
 		return c.selectUniqueRuntimeConnections(targetCount)
 	}
@@ -41,16 +49,23 @@ func (c *Client) selectTargetConnectionsForPacket(packetType uint8, streamID uin
 		preferred Connection
 		found     bool
 	)
+
 	if packetType == Enums.PACKET_STREAM_RESEND {
 		preferred, found = c.selectStreamPreferredConnectionForResend(stream)
 	} else {
 		preferred, found = c.ensureStreamPreferredConnection(stream)
 	}
+
 	if !found {
 		return c.selectUniqueRuntimeConnections(targetCount)
 	}
+
 	if targetCount <= 1 {
 		return []Connection{preferred}, nil
+	}
+
+	if cached, ok := c.getCachedStreamConnectionPlan(stream, preferred.Key, targetCount); ok {
+		return cached, nil
 	}
 
 	selected := make([]Connection, 0, targetCount)
@@ -71,23 +86,11 @@ func (c *Client) selectTargetConnectionsForPacket(packetType uint8, streamID uin
 		}
 	}
 
-	for _, connection := range c.balancer.GetAllValidConnections() {
-		if !connection.IsValid || connection.Key == "" {
-			continue
-		}
-		if _, exists := seenKeys[connection.Key]; exists {
-			continue
-		}
-		selected = append(selected, connection)
-		seenKeys[connection.Key] = struct{}{}
-		if len(selected) >= targetCount {
-			break
-		}
-	}
-
 	if len(selected) == 0 {
 		return nil, ErrNoValidConnections
 	}
+
+	c.cacheStreamConnectionPlan(stream, preferred.Key, targetCount, selected)
 	return selected, nil
 }
 
@@ -95,13 +98,16 @@ func (c *Client) selectUniqueRuntimeConnections(requiredCount int) ([]Connection
 	if c == nil {
 		return nil, ErrNoValidConnections
 	}
+
 	if c.balancer == nil {
 		return nil, ErrNoValidConnections
 	}
+
 	connections := c.balancer.GetUniqueConnections(requiredCount)
 	if len(connections) == 0 {
 		return nil, ErrNoValidConnections
 	}
+
 	return connections, nil
 }
 
@@ -176,6 +182,10 @@ func (c *Client) assignStreamPreferredConnection(stream *Stream_client, connecti
 	stream.resolverMu.Lock()
 	stream.PreferredServerKey = connection.Key
 	stream.ResolverResendStreak = 0
+	stream.CachedResolverPlan = nil
+	stream.CachedResolverPlanFor = ""
+	stream.CachedResolverPlanSize = 0
+	stream.CachedResolverVersion = 0
 	if markFailover {
 		stream.LastResolverFailoverAt = time.Now()
 	}
@@ -230,13 +240,51 @@ func (c *Client) noteStreamProgress(streamID uint16) {
 	stream.resolverMu.Unlock()
 }
 
+func (c *Client) getCachedStreamConnectionPlan(stream *Stream_client, preferredKey string, targetCount int) ([]Connection, bool) {
+	if c == nil || stream == nil || c.balancer == nil || preferredKey == "" || targetCount <= 1 {
+		return nil, false
+	}
+
+	version := c.balancer.SnapshotVersion()
+	stream.resolverMu.Lock()
+	defer stream.resolverMu.Unlock()
+
+	if stream.CachedResolverVersion != version ||
+		stream.CachedResolverPlanFor != preferredKey ||
+		stream.CachedResolverPlanSize != targetCount ||
+		len(stream.CachedResolverPlan) == 0 {
+		return nil, false
+	}
+
+	return stream.CachedResolverPlan, true
+}
+
+func (c *Client) cacheStreamConnectionPlan(stream *Stream_client, preferredKey string, targetCount int, selected []Connection) {
+	if c == nil || stream == nil || c.balancer == nil || preferredKey == "" || targetCount <= 1 || len(selected) == 0 {
+		return
+	}
+
+	cached := make([]Connection, len(selected))
+	copy(cached, selected)
+	version := c.balancer.SnapshotVersion()
+
+	stream.resolverMu.Lock()
+	stream.CachedResolverPlan = cached
+	stream.CachedResolverPlanFor = preferredKey
+	stream.CachedResolverPlanSize = targetCount
+	stream.CachedResolverVersion = version
+	stream.resolverMu.Unlock()
+}
+
 func (c *Client) shouldTransmitQueuedStreamPacket(stream *Stream_client, item *clientStreamTXPacket) bool {
 	if c == nil || stream == nil || item == nil {
 		return false
 	}
+
 	if item.PacketType != Enums.PACKET_STREAM_DATA && item.PacketType != Enums.PACKET_STREAM_RESEND {
 		return true
 	}
+
 	arqObj, ok := stream.Stream.(*arq.ARQ)
 	if !ok || arqObj == nil {
 		return false

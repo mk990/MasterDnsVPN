@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -19,6 +20,12 @@ import (
 	"masterdnsvpn-go/internal/runtimepath"
 	"masterdnsvpn-go/internal/version"
 )
+
+func waitForExitInput() {
+	_, _ = fmt.Fprint(os.Stderr, "Press Enter to exit...")
+	reader := bufio.NewReader(os.Stdin)
+	_, _ = reader.ReadString('\n')
+}
 
 func main() {
 	configPath := flag.String("config", "client_config.toml", "Path to client configuration file")
@@ -36,6 +43,7 @@ func main() {
 	app, err := client.Bootstrap(resolvedConfigPath, *logPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Client startup failed: %v\n", err)
+		waitForExitInput()
 		os.Exit(1)
 	}
 

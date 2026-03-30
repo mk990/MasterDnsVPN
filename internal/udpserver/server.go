@@ -43,7 +43,8 @@ type Server struct {
 	codec                    *security.Codec
 	domainMatcher            *domainMatcher.Matcher
 	sessions                 *sessionStore
-	deferredSession          *deferredSessionProcessor
+	deferredDNSSession       *deferredSessionProcessor
+	deferredConnectSession   *deferredSessionProcessor
 	invalidCookieTracker     *invalidCookieTracker
 	dnsCache                 *dnsCache.Store
 	dnsResolveInflight       *dnsResolveInflightManager
@@ -71,8 +72,14 @@ type Server struct {
 	mtuProbePayloadPool      sync.Pool
 	mtuProbeFillPattern      [256]byte
 	packetPool               sync.Pool
+	deferredInflightMu       sync.Mutex
+	deferredInflight         map[uint64]struct{}
+	immediateConnectedLog    throttledLogState
+	invalidSessionDropLog    throttledLogState
 	droppedPackets           atomic.Uint64
 	lastDropLogUnix          atomic.Int64
+	deferredDroppedPackets   atomic.Uint64
+	lastDeferredDropLogUnix  atomic.Int64
 	pongNonce                atomic.Uint32
 	invalidDropMode          atomic.Uint32
 }
@@ -106,14 +113,16 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 	if socksConnectTimeout <= 0 {
 		socksConnectTimeout = 8 * time.Second
 	}
+	dnsDeferredWorkers, connectDeferredWorkers, dnsDeferredQueue, connectDeferredQueue := splitDeferredSessionPools(cfg.DeferredSessionWorkers, cfg.DeferredSessionQueueLimit)
 	return &Server{
-		cfg:                  cfg,
-		log:                  log,
-		codec:                codec,
-		domainMatcher:        domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength),
-		sessions:             newSessionStore(cfg.SessionOrphanQueueInitialCap, cfg.StreamQueueInitialCapacity, cfg.SessionInitReuseTTL(), cfg.RecentlyClosedStreamTTL(), cfg.RecentlyClosedStreamCap),
-		deferredSession:      newDeferredSessionProcessor(cfg.DeferredSessionWorkers, cfg.DeferredSessionQueueLimit, log),
-		invalidCookieTracker: newInvalidCookieTracker(),
+		cfg:                    cfg,
+		log:                    log,
+		codec:                  codec,
+		domainMatcher:          domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength),
+		sessions:               newSessionStore(cfg.SessionOrphanQueueInitialCap, cfg.StreamQueueInitialCapacity, cfg.SessionInitReuseTTL(), cfg.RecentlyClosedStreamTTL(), cfg.RecentlyClosedStreamCap),
+		deferredDNSSession:     newDeferredSessionProcessor(dnsDeferredWorkers, dnsDeferredQueue, log),
+		deferredConnectSession: newDeferredSessionProcessor(connectDeferredWorkers, connectDeferredQueue, log),
+		invalidCookieTracker:   newInvalidCookieTracker(),
 		dnsCache: dnsCache.New(
 			cfg.DNSCacheMaxRecords,
 			time.Duration(cfg.DNSCacheTTLSeconds*float64(time.Second)),
@@ -150,12 +159,60 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 			},
 		},
 		mtuProbeFillPattern: buildMTUProbeFillPattern(),
+		deferredInflight:    make(map[uint64]struct{}, 128),
 		packetPool: sync.Pool{
 			New: func() any {
 				return make([]byte, cfg.MaxPacketSize)
 			},
 		},
 	}
+}
+
+type throttledLogState struct {
+	mu   sync.Mutex
+	last map[string]int64
+}
+
+func (s *throttledLogState) allow(key string, now time.Time, interval time.Duration) bool {
+	if s == nil {
+		return true
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	nowUnixNano := now.UnixNano()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.last == nil {
+		s.last = make(map[string]int64, 64)
+	}
+
+	last := s.last[key]
+	if last != 0 && nowUnixNano-last < interval.Nanoseconds() {
+		return false
+	}
+	s.last[key] = nowUnixNano
+	return true
+}
+
+func splitDeferredSessionPools(totalWorkers int, totalQueue int) (dnsWorkers int, connectWorkers int, dnsQueue int, connectQueue int) {
+	if totalWorkers <= 0 {
+		totalWorkers = 1
+	}
+	if totalQueue <= 0 {
+		totalQueue = 256
+	}
+
+	// DNS queries use a dedicated lightweight pool so connect-heavy work keeps
+	// the full user-configured deferred capacity.
+	dnsWorkers = 1
+	connectWorkers = totalWorkers
+
+	connectQueue = totalQueue
+	dnsQueue = min(max(totalQueue/4, 64), 256)
+
+	return dnsWorkers, connectWorkers, dnsQueue, connectQueue
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -192,7 +249,8 @@ func (s *Server) Run(ctx context.Context) error {
 		s.sessionCleanupLoop(runCtx)
 	}()
 
-	s.deferredSession.Start(runCtx)
+	s.deferredDNSSession.Start(runCtx)
+	s.deferredConnectSession.Start(runCtx)
 	s.startDNSWorkers(runCtx, conn, reqCh, &workerWG)
 
 	go func() {

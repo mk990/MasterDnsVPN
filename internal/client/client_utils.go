@@ -12,6 +12,7 @@ package client
 import (
 	"crypto/rand"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -63,12 +64,100 @@ func makeConnectionKey(resolver string, port int, domain string) string {
 	return resolver + "|" + strconv.Itoa(port) + "|" + domain
 }
 
+func isHotPacketLogType(packetType uint8) bool {
+	switch packetType {
+	case Enums.PACKET_STREAM_DATA,
+		Enums.PACKET_STREAM_DATA_ACK,
+		Enums.PACKET_STREAM_DATA_NACK,
+		Enums.PACKET_STREAM_RESEND,
+		Enums.PACKET_PACKED_CONTROL_BLOCKS,
+		Enums.PACKET_PING,
+		Enums.PACKET_PONG:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) logInboundPacket(packetType uint8, sessionID uint8, payloadLen int, streamID uint16, sequenceNum uint16, fragmentID uint8, totalFragments uint8, packedSummary string) {
+	if c == nil || c.log == nil || packetType == Enums.PACKET_PONG {
+		return
+	}
+	format := "<green>Receiving Packet, Packet: %s | Session %d | Payload Len(%d) | Stream: %d | Seq: %d | Fg: %d | TF: %d%s</green>"
+	if isHotPacketLogType(packetType) {
+		if c.log.Enabled(logger.LevelDebug) {
+			c.log.Debugf(format, Enums.PacketTypeName(packetType), sessionID, payloadLen, streamID, sequenceNum, fragmentID, totalFragments, packedSummary)
+		}
+		return
+	}
+	c.log.Warnf(format, Enums.PacketTypeName(packetType), sessionID, payloadLen, streamID, sequenceNum, fragmentID, totalFragments, packedSummary)
+}
+
+func (c *Client) logOutboundPacket(packetType uint8, sessionID uint8, payloadLen int, streamID uint16, sequenceNum uint16, fragmentID uint8, totalFragments uint8, packedSummary string) {
+	if c == nil || c.log == nil || packetType == Enums.PACKET_PING {
+		return
+	}
+	format := "<cyan>Sending Packet, Packet: Packet: %s | Session %d | Payload Len(%d) | Stream: %d | Seq: %d | Fg: %d | TF: %d%s</cyan>"
+	if isHotPacketLogType(packetType) {
+		if c.log.Enabled(logger.LevelDebug) {
+			c.log.Debugf(format, Enums.PacketTypeName(packetType), sessionID, payloadLen, streamID, sequenceNum, fragmentID, totalFragments, packedSummary)
+		}
+		return
+	}
+	c.log.Warnf(format, Enums.PacketTypeName(packetType), sessionID, payloadLen, streamID, sequenceNum, fragmentID, totalFragments, packedSummary)
+}
+
+func (c *Client) getResolverUDPAddr(conn Connection) (*net.UDPAddr, error) {
+	if c == nil {
+		return nil, ErrNoValidConnections
+	}
+
+	label := conn.ResolverLabel
+	if label == "" {
+		label = formatResolverEndpoint(conn.Resolver, conn.ResolverPort)
+	}
+
+	c.resolverAddrMu.RLock()
+	if addr, ok := c.resolverAddrCache[label]; ok && addr != nil {
+		c.resolverAddrMu.RUnlock()
+		return addr, nil
+	}
+	c.resolverAddrMu.RUnlock()
+
+	var addr *net.UDPAddr
+	if ip := net.ParseIP(conn.Resolver); ip != nil {
+		addr = &net.UDPAddr{IP: ip, Port: conn.ResolverPort}
+	} else {
+		resolved, err := net.ResolveUDPAddr("udp", label)
+		if err != nil {
+			return nil, err
+		}
+		addr = resolved
+	}
+
+	c.resolverAddrMu.Lock()
+	if existing, ok := c.resolverAddrCache[label]; ok && existing != nil {
+		c.resolverAddrMu.Unlock()
+		return existing, nil
+	}
+	c.resolverAddrCache[label] = addr
+	c.resolverAddrMu.Unlock()
+	return addr, nil
+}
+
 // now returns the current time.
 func (c *Client) now() time.Time {
 	if c != nil && c.nowFn != nil {
 		return c.nowFn()
 	}
 	return time.Now()
+}
+
+func (c *Client) bumpStreamSetVersion() {
+	if c == nil {
+		return
+	}
+	c.streamSetVersion.Add(1)
 }
 
 func (c *Client) SessionReady() bool {
@@ -180,6 +269,10 @@ func (c *Client) consumeInboundStreamAck(packetType uint8, packet VpnProto.Packe
 		return false
 	}
 
+	if packetType == Enums.PACKET_STREAM_RST_ACK {
+		c.rememberClosedStream(packet.StreamID, "ACK acknowledged", time.Now())
+	}
+
 	arqObj, ok := s.Stream.(*arq.ARQ)
 	if !ok {
 		return false
@@ -207,10 +300,100 @@ func (c *Client) consumeInboundStreamAck(packetType uint8, packet VpnProto.Packe
 }
 
 func (c *Client) getStream(streamID uint16) (*Stream_client, bool) {
-	c.streamsMu.Lock()
+	c.streamsMu.RLock()
 	s, ok := c.active_streams[streamID]
-	c.streamsMu.Unlock()
+	c.streamsMu.RUnlock()
 	return s, ok
+}
+
+func (c *Client) shouldRememberClosedStream(reason string) bool {
+	if c == nil {
+		return false
+	}
+
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return false
+	}
+
+	if reason == "close handshake completed" || reason == "client local disconnect completed" {
+		return true
+	}
+
+	return strings.HasSuffix(reason, "acknowledged")
+}
+
+func (c *Client) rememberClosedStream(streamID uint16, reason string, now time.Time) {
+	if c == nil || streamID == 0 || !c.shouldRememberClosedStream(reason) {
+		return
+	}
+
+	retention := c.cfg.ClientTerminalStreamRetention()
+	if retention <= 0 {
+		retention = 15 * time.Second
+	}
+
+	c.recentlyClosedMu.Lock()
+	// Cap the map to prevent unbounded growth during long sessions.
+	// If at limit, evict the oldest entry before adding.
+	const maxRecentlyClosed = 2000
+	if len(c.recentlyClosedStreams) >= maxRecentlyClosed {
+		var oldestID uint16
+		var oldestTime time.Time
+		for id, t := range c.recentlyClosedStreams {
+			if oldestTime.IsZero() || t.Before(oldestTime) {
+				oldestID = id
+				oldestTime = t
+			}
+		}
+		delete(c.recentlyClosedStreams, oldestID)
+	}
+	c.recentlyClosedStreams[streamID] = now.Add(retention)
+	c.recentlyClosedMu.Unlock()
+}
+
+func (c *Client) isRecentlyClosedStream(streamID uint16, now time.Time) bool {
+	if c == nil || streamID == 0 {
+		return false
+	}
+
+	c.recentlyClosedMu.Lock()
+	defer c.recentlyClosedMu.Unlock()
+
+	expiresAt, ok := c.recentlyClosedStreams[streamID]
+	if !ok {
+		return false
+	}
+	if now.Before(expiresAt) {
+		return true
+	}
+
+	delete(c.recentlyClosedStreams, streamID)
+	return false
+}
+
+func (c *Client) cleanupRecentlyClosedStreams(now time.Time) {
+	if c == nil {
+		return
+	}
+
+	c.recentlyClosedMu.Lock()
+	for streamID, expiresAt := range c.recentlyClosedStreams {
+		if !now.Before(expiresAt) {
+			delete(c.recentlyClosedStreams, streamID)
+		}
+	}
+	c.recentlyClosedMu.Unlock()
+}
+
+func (c *Client) clearRecentlyClosedStreams() {
+	if c == nil {
+		return
+	}
+
+	c.recentlyClosedMu.Lock()
+	clear(c.recentlyClosedStreams)
+	c.recentlyClosedMu.Unlock()
 }
 
 func (c *Client) handleMissingStreamPacket(packet VpnProto.Packet) bool {
@@ -225,8 +408,12 @@ func (c *Client) handleMissingStreamPacket(packet VpnProto.Packet) bool {
 	}
 
 	// No need to send Response for ACK packets
-	if packet.PacketType == Enums.PACKET_STREAM_DATA_ACK {
+	if packet.PacketType == Enums.PACKET_STREAM_DATA_ACK || packet.PacketType == Enums.PACKET_STREAM_DATA_NACK {
 		return true
+	}
+
+	if packet.PacketType == Enums.PACKET_STREAM_RST_ACK {
+		c.rememberClosedStream(packet.StreamID, "ACK acknowledged", time.Now())
 	}
 
 	if _, ok := Enums.ReverseControlAckFor(packet.PacketType); ok {
@@ -240,13 +427,34 @@ func (c *Client) handleMissingStreamPacket(packet VpnProto.Packet) bool {
 
 	// GetPacketCloseStream
 	ack_answer, ok := Enums.GetPacketCloseStream(packet.PacketType)
-	if ok && packet.PacketType != Enums.PACKET_STREAM_FIN {
+	if ok {
 		c.enqueueOrphanReset(ack_answer, packet.StreamID, 0)
 	} else {
 		c.enqueueOrphanReset(Enums.PACKET_STREAM_RST, packet.StreamID, 0)
 	}
 
 	return true
+}
+
+func (c *Client) ackRecentlyClosedStreamPacket(packet VpnProto.Packet) bool {
+	if c == nil || packet.StreamID == 0 {
+		return false
+	}
+
+	if packet.PacketType == Enums.PACKET_STREAM_DATA_ACK || packet.PacketType == Enums.PACKET_STREAM_DATA_NACK {
+		return true
+	}
+
+	if _, ok := Enums.ReverseControlAckFor(packet.PacketType); ok {
+		return true
+	}
+
+	if ackType, ok := Enums.ControlAckFor(packet.PacketType); ok {
+		c.enqueueOrphanReset(ackType, packet.StreamID, packet.SequenceNum)
+		return true
+	}
+
+	return false
 }
 
 func (c *Client) preprocessInboundPacket(packet VpnProto.Packet) bool {
@@ -256,6 +464,18 @@ func (c *Client) preprocessInboundPacket(packet VpnProto.Packet) bool {
 
 	exists_stream, stream_exists := c.getStream(packet.StreamID)
 	if packet.StreamID != 0 && (!stream_exists || exists_stream == nil) {
+		if c.isRecentlyClosedStream(packet.StreamID, c.now()) {
+			if packet.PacketType == Enums.PACKET_STREAM_DATA ||
+				packet.PacketType == Enums.PACKET_STREAM_RESEND {
+				c.enqueueOrphanReset(Enums.PACKET_STREAM_RST, packet.StreamID, 0)
+				return true
+			}
+			if c.ackRecentlyClosedStreamPacket(packet) {
+				return true
+			}
+			return true
+		}
+
 		c.handleMissingStreamPacket(packet)
 		return true
 	}
@@ -276,9 +496,9 @@ func (c *Client) PreprocessInboundPacket(packet VpnProto.Packet) bool {
 }
 
 func (c *Client) getStreamARQ(streamID uint16) (*arq.ARQ, error) {
-	c.streamsMu.Lock()
+	c.streamsMu.RLock()
 	s, ok := c.active_streams[streamID]
-	c.streamsMu.Unlock()
+	c.streamsMu.RUnlock()
 
 	if !ok || s == nil {
 		return nil, fmt.Errorf("stream not found")
@@ -375,6 +595,9 @@ func (c *Client) BuildConnectionMap() error {
 				Key:           key,
 				IsValid:       true,
 			})
+			if ip := net.ParseIP(resolver.IP); ip != nil {
+				c.resolverAddrCache[label] = &net.UDPAddr{IP: ip, Port: resolver.Port}
+			}
 		}
 	}
 

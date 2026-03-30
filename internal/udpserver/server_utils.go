@@ -58,7 +58,9 @@ func isClosedStreamAwarePacketType(packetType uint8) bool {
 		Enums.PACKET_STREAM_DATA,
 		Enums.PACKET_STREAM_RESEND,
 		Enums.PACKET_STREAM_DATA_ACK,
-		Enums.PACKET_STREAM_FIN,
+		Enums.PACKET_STREAM_DATA_NACK,
+		Enums.PACKET_STREAM_CLOSE_WRITE,
+		Enums.PACKET_STREAM_CLOSE_READ,
 		Enums.PACKET_STREAM_RST:
 		return true
 	default:

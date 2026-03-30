@@ -44,6 +44,8 @@ type Client struct {
 	udpBufferPool       sync.Pool
 	resolverConnsMu     sync.Mutex
 	resolverConns       map[string]chan *net.UDPConn
+	resolverAddrMu      sync.RWMutex
+	resolverAddrCache   map[string]*net.UDPAddr
 	resolverStatsMu     sync.Mutex
 	resolverPending     map[resolverSampleKey]resolverSample
 	resolverHealthMu    sync.Mutex
@@ -92,6 +94,8 @@ type Client struct {
 	sessionResetPending atomic.Bool
 	runtimeResetPending atomic.Bool
 	sessionResetSignal  chan struct{}
+	rxDroppedPackets    atomic.Uint64
+	lastRXDropLogUnix   atomic.Int64
 
 	// Async Runtime Workers & Channels
 	asyncWG              sync.WaitGroup
@@ -109,13 +113,17 @@ type Client struct {
 	dnsListener *DNSListener
 
 	// Stream Management
-	streamsMu      sync.RWMutex
-	active_streams map[uint16]*Stream_client
-	last_stream_id uint16
-	orphanQueue    *mlq.MultiLevelQueue[VpnProto.Packet]
+	streamsMu             sync.RWMutex
+	active_streams        map[uint16]*Stream_client
+	last_stream_id        uint16
+	streamSetVersion      atomic.Uint64
+	orphanQueue           *mlq.MultiLevelQueue[VpnProto.Packet]
+	recentlyClosedMu      sync.Mutex
+	recentlyClosedStreams map[uint16]time.Time
 
-	// Signal to wake up dispatcher
-	txSignal chan struct{}
+	// Signals to wake up dispatcher.
+	txSignal      chan struct{}
+	txSpaceSignal chan struct{}
 
 	// Autonomous Ping Manager
 	pingManager *PingManager
@@ -213,6 +221,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 			},
 		},
 		resolverConns:                         make(map[string]chan *net.UDPConn),
+		resolverAddrCache:                     make(map[string]*net.UDPAddr),
 		resolverPending:                       make(map[resolverSampleKey]resolverSample),
 		resolverHealth:                        make(map[string]*resolverHealthState),
 		resolverRecheck:                       make(map[string]resolverRecheckState),
@@ -229,14 +238,16 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		streamResolverFailoverCooldown:        time.Duration(cfg.StreamResolverFailoverCooldownSec * float64(time.Second)),
 
 		// Workers config
-		tunnelReaderWorkers:  cfg.TunnelReaderWorkers,
-		tunnelWriterWorkers:  cfg.TunnelWriterWorkers,
-		tunnelProcessWorkers: cfg.TunnelProcessWorkers,
-		tunnelPacketTimeout:  time.Duration(cfg.TunnelPacketTimeoutSec * float64(time.Second)),
-		txChannel:            make(chan asyncPacket, cfg.TXChannelSize),
-		rxChannel:            make(chan asyncReadPacket, cfg.RXChannelSize),
-		active_streams:       make(map[uint16]*Stream_client),
-		txSignal:             make(chan struct{}, 1),
+		tunnelReaderWorkers:   cfg.TunnelReaderWorkers,
+		tunnelWriterWorkers:   cfg.TunnelWriterWorkers,
+		tunnelProcessWorkers:  cfg.TunnelProcessWorkers,
+		tunnelPacketTimeout:   time.Duration(cfg.TunnelPacketTimeoutSec * float64(time.Second)),
+		txChannel:             make(chan asyncPacket, cfg.TXChannelSize),
+		rxChannel:             make(chan asyncReadPacket, cfg.RXChannelSize),
+		active_streams:        make(map[uint16]*Stream_client),
+		recentlyClosedStreams: make(map[uint16]time.Time),
+		txSignal:              make(chan struct{}, 1),
+		txSpaceSignal:         make(chan struct{}, 1),
 
 		// DNS Management
 		localDNSCache: dnsCache.New(
@@ -409,21 +420,46 @@ func (c *Client) HandleStreamPacket(packet VpnProto.Packet) error {
 
 	arqObj, ok := s.Stream.(*arq.ARQ)
 	if !ok {
+		if (packet.PacketType == Enums.PACKET_STREAM_DATA ||
+			packet.PacketType == Enums.PACKET_STREAM_RESEND ||
+			packet.PacketType == Enums.PACKET_STREAM_DATA_NACK) && !c.isRecentlyClosedStream(packet.StreamID, c.now()) {
+			c.enqueueOrphanReset(Enums.PACKET_STREAM_RST, packet.StreamID, 0)
+		}
 		return nil
 	}
 
 	switch packet.PacketType {
 	case Enums.PACKET_STREAM_DATA, Enums.PACKET_STREAM_RESEND:
+		if arqObj.IsClosed() {
+			c.enqueueOrphanReset(Enums.PACKET_STREAM_RST, packet.StreamID, 0)
+			return nil
+		}
+
+		if !s.TerminalSince().IsZero() {
+			c.enqueueOrphanReset(Enums.PACKET_STREAM_RST, packet.StreamID, 0)
+			return nil
+		}
+
+		if !arqObj.ReceiveData(packet.SequenceNum, packet.Payload) {
+			return nil
+		}
+
+	case Enums.PACKET_STREAM_DATA_NACK:
 		if arqObj.IsClosed() || !s.TerminalSince().IsZero() {
 			return nil
 		}
-		arqObj.ReceiveData(packet.SequenceNum, packet.Payload)
+
+		if arqObj.HandleDataNack(packet.SequenceNum) {
+			c.noteStreamProgress(packet.StreamID)
+		}
 	case Enums.PACKET_STREAM_CONNECTED:
 		return c.handleStreamConnected(packet, s, arqObj)
 	case Enums.PACKET_STREAM_CONNECT_FAIL:
 		return c.handleStreamConnectFail(packet, s, arqObj)
-	case Enums.PACKET_STREAM_FIN:
-		arqObj.MarkFinReceived()
+	case Enums.PACKET_STREAM_CLOSE_READ:
+		arqObj.MarkCloseReadReceived()
+	case Enums.PACKET_STREAM_CLOSE_WRITE:
+		arqObj.MarkCloseWriteReceived()
 	case Enums.PACKET_STREAM_RST:
 		arqObj.MarkRstReceived()
 		arqObj.Close("peer reset received", arq.CloseOptions{Force: true})

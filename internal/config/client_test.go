@@ -160,6 +160,12 @@ ENCRYPTION_KEY = "secret"
 	if cfg.ARQInitialRTOSeconds != 1.0 || cfg.ARQMaxRTOSeconds != 8.0 {
 		t.Fatalf("unexpected arq rto defaults: initial=%v max=%v", cfg.ARQInitialRTOSeconds, cfg.ARQMaxRTOSeconds)
 	}
+	if cfg.ARQDataNackMaxGap != 0 {
+		t.Fatalf("unexpected ARQ data NACK gap default: got=%d want=0", cfg.ARQDataNackMaxGap)
+	}
+	if cfg.ARQDataNackRepeatSeconds != 2.0 {
+		t.Fatalf("unexpected ARQ data NACK repeat default: got=%v want=%v", cfg.ARQDataNackRepeatSeconds, 2.0)
+	}
 	if cfg.ARQMaxControlRetries != 80 || cfg.ARQMaxDataRetries != 800 {
 		t.Fatalf("unexpected arq retry defaults: control=%d data=%d", cfg.ARQMaxControlRetries, cfg.ARQMaxDataRetries)
 	}

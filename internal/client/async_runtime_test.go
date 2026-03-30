@@ -9,11 +9,15 @@ package client
 
 import (
 	"context"
+	"encoding/binary"
+	"net"
 	"testing"
 	"time"
 
 	"masterdnsvpn-go/internal/arq"
 	"masterdnsvpn-go/internal/config"
+	DnsParser "masterdnsvpn-go/internal/dnsparser"
+	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/security"
 )
@@ -73,6 +77,32 @@ func TestClearTxSignal(t *testing.T) {
 	case <-c.txSignal:
 		t.Fatal("txSignal should be empty")
 	default:
+	}
+}
+
+func TestClearTxSpaceSignal(t *testing.T) {
+	c := createTestClient(t)
+	c.txSpaceSignal = make(chan struct{}, 5)
+	c.txSpaceSignal <- struct{}{}
+	c.txSpaceSignal <- struct{}{}
+
+	c.clearTxSpaceSignal()
+
+	select {
+	case <-c.txSpaceSignal:
+		t.Fatal("txSpaceSignal should be empty")
+	default:
+	}
+}
+
+func TestOnRXDropIncrementsCounter(t *testing.T) {
+	c := createTestClient(t)
+	addr := &net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 53}
+
+	c.onRXDrop(addr)
+
+	if got := c.rxDroppedPackets.Load(); got != 1 {
+		t.Fatalf("expected rxDroppedPackets=1, got %d", got)
 	}
 }
 
@@ -180,4 +210,74 @@ func TestStartAsyncRuntime(t *testing.T) {
 	}
 
 	c.StopAsyncRuntime()
+}
+
+func TestHandleInboundPacketTreatsMissingTXTAsResolverSuccess(t *testing.T) {
+	c := buildTestClientWithResolvers(config.ClientConfig{}, "a", "b", "c", "d")
+	c.initResolverRecheckMeta()
+	addr := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}
+
+	query, err := DnsParser.BuildTXTQuestionPacket("x.v.example.com", 16, 4096)
+	if err != nil {
+		t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
+	}
+	response, err := DnsParser.BuildEmptyNoErrorResponse(query)
+	if err != nil {
+		t.Fatalf("BuildEmptyNoErrorResponse returned error: %v", err)
+	}
+
+	dnsID := binary.BigEndian.Uint16(response[:2])
+	c.resolverPending[resolverSampleKey{
+		resolverAddr: addr.String(),
+		dnsID:        dnsID,
+	}] = resolverSample{
+		serverKey: "a",
+		sentAt:    time.Now().Add(-200 * time.Millisecond),
+	}
+
+	c.handleInboundPacket(response, addr)
+
+	if len(c.resolverPending) != 0 {
+		t.Fatalf("expected resolverPending to be cleared after empty DNS success, got=%d", len(c.resolverPending))
+	}
+}
+
+func TestHandleInboundPacketTreatsServerFailureWithoutTXTAsResolverFailure(t *testing.T) {
+	c := buildTestClientWithResolvers(config.ClientConfig{}, "a", "b", "c", "d")
+	c.initResolverRecheckMeta()
+	addr := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}
+
+	query, err := DnsParser.BuildTXTQuestionPacket("x.v.example.com", Enums.DNS_RECORD_TYPE_TXT, 4096)
+	if err != nil {
+		t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
+	}
+	response, err := DnsParser.BuildServerFailureResponse(query)
+	if err != nil {
+		t.Fatalf("BuildServerFailureResponse returned error: %v", err)
+	}
+
+	dnsID := binary.BigEndian.Uint16(response[:2])
+	c.resolverPending[resolverSampleKey{
+		resolverAddr: addr.String(),
+		dnsID:        dnsID,
+	}] = resolverSample{
+		serverKey: "a",
+		sentAt:    time.Now().Add(-200 * time.Millisecond),
+	}
+
+	c.handleInboundPacket(response, addr)
+
+	if len(c.resolverPending) != 0 {
+		t.Fatalf("expected resolverPending to be cleared after SERVFAIL response, got=%d", len(c.resolverPending))
+	}
+
+	c.resolverHealthMu.Lock()
+	state := c.resolverHealth["a"]
+	c.resolverHealthMu.Unlock()
+	if state == nil {
+		t.Fatal("expected resolver health state to exist")
+	}
+	if len(state.Events) != 1 {
+		t.Fatalf("expected one failure health event after SERVFAIL response, got=%d", len(state.Events))
+	}
 }

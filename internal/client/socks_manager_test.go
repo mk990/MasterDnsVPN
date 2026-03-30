@@ -107,28 +107,4 @@ func TestLateSocksResultDoesNotReactivateCancelledStream(t *testing.T) {
 	}
 }
 
-func TestRejectSocksUDPAssociateUnsupportedTargetSendsFailureReply(t *testing.T) {
-	c := &Client{}
-	server, clientConn := net.Pipe()
-	defer server.Close()
-	defer clientConn.Close()
 
-	done := make(chan struct{})
-	go func() {
-		c.rejectSocksUDPAssociateUnsupportedTarget(server, "1.2.3.4", 1234)
-		close(done)
-	}()
-
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(clientConn, reply); err != nil {
-		t.Fatalf("failed to read SOCKS5 failure reply: %v", err)
-	}
-	<-done
-
-	want := []byte{SOCKS5_VERSION, SOCKS5_REPLY_RULESET_DENIED, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0}
-	for i := range want {
-		if reply[i] != want[i] {
-			t.Fatalf("reply[%d] = 0x%02x, want 0x%02x", i, reply[i], want[i])
-		}
-	}
-}

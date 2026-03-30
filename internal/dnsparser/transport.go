@@ -10,6 +10,7 @@ package dnsparser
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 
@@ -221,6 +222,55 @@ func ExtractVPNResponse(packet []byte, baseEncoded bool) (VpnProto.Packet, error
 	}
 
 	return assembleVPNResponse(rawAnswers, baseEncoded)
+}
+
+func DescribeResponseWithoutTunnelPayload(packet []byte) string {
+	parsed, err := ParsePacket(packet)
+	if err != nil {
+		return fmt.Sprintf("unparseable dns response: %v", err)
+	}
+
+	qName := "-"
+	if len(parsed.Questions) > 0 && parsed.Questions[0].Name != "" {
+		qName = parsed.Questions[0].Name
+	}
+
+	answerKinds := summarizeRecordTypes(parsed.Answers)
+	if answerKinds == "" {
+		answerKinds = "none"
+	}
+
+	return fmt.Sprintf(
+		"RCODE=%d QD=%d AN=%d NS=%d AR=%d QName=%s Answers=%s",
+		parsed.Header.RCode,
+		parsed.Header.QDCount,
+		parsed.Header.ANCount,
+		parsed.Header.NSCount,
+		parsed.Header.ARCount,
+		qName,
+		answerKinds,
+	)
+}
+
+func summarizeRecordTypes(records []ResourceRecord) string {
+	if len(records) == 0 {
+		return ""
+	}
+
+	counts := make(map[uint16]int, len(records))
+	order := make([]uint16, 0, len(records))
+	for _, rr := range records {
+		if _, ok := counts[rr.Type]; !ok {
+			order = append(order, rr.Type)
+		}
+		counts[rr.Type]++
+	}
+
+	parts := make([]string, 0, len(order))
+	for _, rrType := range order {
+		parts = append(parts, fmt.Sprintf("%s x%d", Enums.DNSRecordTypeName(rrType), counts[rrType]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func CalculateMaxEncodedQNameChars(domain string) int {

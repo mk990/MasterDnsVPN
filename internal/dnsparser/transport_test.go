@@ -10,6 +10,7 @@ package dnsparser
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 
 	"masterdnsvpn-go/internal/compression"
@@ -248,4 +249,29 @@ func stringsOf(ch byte, count int) string {
 		buf[i] = ch
 	}
 	return string(buf)
+}
+
+func TestDescribeResponseWithoutTunnelPayloadEmptyNoError(t *testing.T) {
+	query, err := BuildTXTQuestionPacket("x.v.example.com", Enums.DNS_RECORD_TYPE_TXT, 4096)
+	if err != nil {
+		t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
+	}
+
+	response, err := BuildEmptyNoErrorResponse(query)
+	if err != nil {
+		t.Fatalf("BuildEmptyNoErrorResponse returned error: %v", err)
+	}
+
+	summary := DescribeResponseWithoutTunnelPayload(response)
+	for _, want := range []string{
+		"RCODE=0",
+		"QD=1",
+		"AN=0",
+		"QName=x.v.example.com",
+		"Answers=none",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary missing %q: %s", want, summary)
+		}
+	}
 }
