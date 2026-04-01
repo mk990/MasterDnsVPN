@@ -317,6 +317,95 @@ type writeDeadlineTimeoutConn struct {
 	closed        bool
 }
 
+type aggregateWriteConn struct {
+	mu         sync.Mutex
+	writes     [][]byte
+	writeCount int
+	totalBytes int
+	writeCh    chan int
+	closed     bool
+}
+
+func newAggregateWriteConn() *aggregateWriteConn {
+	return &aggregateWriteConn{
+		writeCh: make(chan int, 4096),
+	}
+}
+
+func (c *aggregateWriteConn) Read(_ []byte) (int, error) {
+	time.Sleep(50 * time.Millisecond)
+	return 0, timeoutOnlyError{}
+}
+
+func (c *aggregateWriteConn) Write(p []byte) (int, error) {
+	payload := append([]byte(nil), p...)
+	c.mu.Lock()
+	c.writes = append(c.writes, payload)
+	c.writeCount++
+	c.totalBytes += len(payload)
+	c.mu.Unlock()
+
+	select {
+	case c.writeCh <- len(payload):
+	default:
+	}
+
+	return len(p), nil
+}
+
+func (c *aggregateWriteConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *aggregateWriteConn) snapshot() ([][]byte, int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	writes := make([][]byte, len(c.writes))
+	for i := range c.writes {
+		writes[i] = append([]byte(nil), c.writes[i]...)
+	}
+	return writes, c.writeCount, c.totalBytes
+}
+
+func (c *aggregateWriteConn) resetMetrics() {
+	c.mu.Lock()
+	c.writes = c.writes[:0]
+	c.writeCount = 0
+	c.totalBytes = 0
+	c.mu.Unlock()
+
+	for {
+		select {
+		case <-c.writeCh:
+		default:
+			return
+		}
+	}
+}
+
+func (c *aggregateWriteConn) waitForBytes(target int, timeout time.Duration) error {
+	if target <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	received := 0
+	for received < target {
+		select {
+		case n := <-c.writeCh:
+			received += n
+		case <-timer.C:
+			return errors.New("timed out waiting for aggregated writes")
+		}
+	}
+	return nil
+}
+
 func (c *writeDeadlineTimeoutConn) Read(_ []byte) (int, error) {
 	time.Sleep(50 * time.Millisecond)
 	return 0, timeoutOnlyError{}
@@ -520,11 +609,11 @@ func TestARQ_ReceiveDataDoesNotNackFarGap(t *testing.T) {
 
 	firstNack := <-enqueuer.Packets
 	secondNack := <-enqueuer.Packets
-	if firstNack.packetType != Enums.PACKET_STREAM_DATA_NACK || firstNack.sequenceNum != 1 {
-		t.Fatalf("expected first DATA_NACK for seq 1, got %s seq=%d", Enums.PacketTypeName(firstNack.packetType), firstNack.sequenceNum)
+	if firstNack.packetType != Enums.PACKET_STREAM_DATA_NACK || firstNack.sequenceNum != 0 {
+		t.Fatalf("expected first sampled DATA_NACK for seq 0, got %s seq=%d", Enums.PacketTypeName(firstNack.packetType), firstNack.sequenceNum)
 	}
-	if secondNack.packetType != Enums.PACKET_STREAM_DATA_NACK || secondNack.sequenceNum != 2 {
-		t.Fatalf("expected second DATA_NACK for seq 2, got %s seq=%d", Enums.PacketTypeName(secondNack.packetType), secondNack.sequenceNum)
+	if secondNack.packetType != Enums.PACKET_STREAM_DATA_NACK || secondNack.sequenceNum != 1 {
+		t.Fatalf("expected frontier DATA_NACK for seq 1, got %s seq=%d", Enums.PacketTypeName(secondNack.packetType), secondNack.sequenceNum)
 	}
 	select {
 	case extra := <-enqueuer.Packets:
@@ -650,6 +739,78 @@ func TestARQ_ReceiveDataSuppressesRepeatedNackUntilInterval(t *testing.T) {
 	}
 }
 
+func TestARQ_ReceiveDataWaitsForInitialNackDelay(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	a := NewARQ(1, 1, enqueuer, nil, 1000, &testLogger{t}, Config{
+		WindowSize:                  64,
+		RTO:                         0.2,
+		MaxRTO:                      1.0,
+		DataNackMaxGap:              2,
+		DataNackInitialDelaySeconds: 0.2,
+		DataNackRepeatSeconds:       1.0,
+	})
+
+	a.ReceiveData(1, []byte("packet 1"))
+
+	first := <-enqueuer.Packets
+	if first.packetType != Enums.PACKET_STREAM_DATA_ACK {
+		t.Fatalf("expected DATA_ACK, got %s", Enums.PacketTypeName(first.packetType))
+	}
+
+	select {
+	case extra := <-enqueuer.Packets:
+		t.Fatalf("expected no immediate DATA_NACK before initial delay, got %s seq=%d", Enums.PacketTypeName(extra.packetType), extra.sequenceNum)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	time.Sleep(220 * time.Millisecond)
+	a.ReceiveData(1, []byte("packet 1"))
+
+	second := <-enqueuer.Packets
+	if second.packetType != Enums.PACKET_STREAM_DATA_ACK {
+		t.Fatalf("expected second DATA_ACK, got %s", Enums.PacketTypeName(second.packetType))
+	}
+
+	nack := <-enqueuer.Packets
+	if nack.packetType != Enums.PACKET_STREAM_DATA_NACK || nack.sequenceNum != 0 {
+		t.Fatalf("expected delayed DATA_NACK for seq 0, got %s seq=%d", Enums.PacketTypeName(nack.packetType), nack.sequenceNum)
+	}
+}
+
+func TestARQ_ReceiveDataClearsPendingInitialNackDelayWhenGapArrives(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	a := NewARQ(1, 1, enqueuer, nil, 1000, &testLogger{t}, Config{
+		WindowSize:                  64,
+		RTO:                         0.2,
+		MaxRTO:                      1.0,
+		DataNackMaxGap:              3,
+		DataNackInitialDelaySeconds: 0.2,
+		DataNackRepeatSeconds:       1.0,
+	})
+
+	a.ReceiveData(2, []byte("packet 2"))
+	if p := <-enqueuer.Packets; p.packetType != Enums.PACKET_STREAM_DATA_ACK {
+		t.Fatalf("expected DATA_ACK for seq 2, got %s", Enums.PacketTypeName(p.packetType))
+	}
+
+	a.ReceiveData(0, []byte("packet 0"))
+	if p := <-enqueuer.Packets; p.packetType != Enums.PACKET_STREAM_DATA_ACK {
+		t.Fatalf("expected DATA_ACK for seq 0, got %s", Enums.PacketTypeName(p.packetType))
+	}
+
+	time.Sleep(220 * time.Millisecond)
+	a.ReceiveData(1, []byte("packet 1"))
+	if p := <-enqueuer.Packets; p.packetType != Enums.PACKET_STREAM_DATA_ACK {
+		t.Fatalf("expected DATA_ACK for seq 1, got %s", Enums.PacketTypeName(p.packetType))
+	}
+
+	select {
+	case extra := <-enqueuer.Packets:
+		t.Fatalf("expected resolved gap to suppress delayed NACK, got %s seq=%d", Enums.PacketTypeName(extra.packetType), extra.sequenceNum)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestARQ_ReceiveDataDoesNotNackAlreadyBufferedGap(t *testing.T) {
 	enqueuer := NewMockPacketEnqueuer()
 	a := NewARQ(1, 1, enqueuer, nil, 1000, &testLogger{t}, Config{
@@ -706,16 +867,49 @@ func TestARQ_ReceiveDataNacksRecentWindowWhenRcvNxtStalls(t *testing.T) {
 
 	a.ReceiveData(10, []byte("packet 10"))
 	<-enqueuer.Packets // DATA_ACK
-	for expected := uint16(6); expected < 10; expected++ {
-		nack := <-enqueuer.Packets
-		if nack.packetType != Enums.PACKET_STREAM_DATA_NACK || nack.sequenceNum != expected {
-			t.Fatalf("expected recent-window NACK for seq %d, got %s seq=%d", expected, Enums.PacketTypeName(nack.packetType), nack.sequenceNum)
-		}
+	first := <-enqueuer.Packets
+	if first.packetType != Enums.PACKET_STREAM_DATA_NACK || first.sequenceNum != 0 {
+		t.Fatalf("expected first sampled NACK for seq 0, got %s seq=%d", Enums.PacketTypeName(first.packetType), first.sequenceNum)
+	}
+	second := <-enqueuer.Packets
+	if second.packetType != Enums.PACKET_STREAM_DATA_NACK || second.sequenceNum != 3 {
+		t.Fatalf("expected frontier NACK for seq 3, got %s seq=%d", Enums.PacketTypeName(second.packetType), second.sequenceNum)
 	}
 
 	select {
 	case extra := <-enqueuer.Packets:
 		t.Fatalf("expected no NACKs outside recent window, got %s seq=%d", Enums.PacketTypeName(extra.packetType), extra.sequenceNum)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestARQ_ReceiveDataLargeGapSamplesFrontierInsteadOfFloodingNacks(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	a := NewARQ(1, 1, enqueuer, nil, 1000, &testLogger{t}, Config{
+		WindowSize:            256,
+		RTO:                   0.2,
+		MaxRTO:                1.0,
+		DataNackMaxGap:        100,
+		DataNackRepeatSeconds: 0.1,
+	})
+
+	a.ReceiveData(140, []byte("packet 140"))
+	ack := <-enqueuer.Packets
+	if ack.packetType != Enums.PACKET_STREAM_DATA_ACK || ack.sequenceNum != 140 {
+		t.Fatalf("expected DATA_ACK for seq 140, got %s seq=%d", Enums.PacketTypeName(ack.packetType), ack.sequenceNum)
+	}
+
+	expected := []uint16{0, 1, 2, 3, 4, 99}
+	for _, seq := range expected {
+		nack := <-enqueuer.Packets
+		if nack.packetType != Enums.PACKET_STREAM_DATA_NACK || nack.sequenceNum != seq {
+			t.Fatalf("expected NACK for seq %d, got %s seq=%d", seq, Enums.PacketTypeName(nack.packetType), nack.sequenceNum)
+		}
+	}
+
+	select {
+	case extra := <-enqueuer.Packets:
+		t.Fatalf("expected bounded NACK sampling, got extra %s seq=%d", Enums.PacketTypeName(extra.packetType), extra.sequenceNum)
 	case <-time.After(50 * time.Millisecond):
 	}
 }
@@ -926,18 +1120,17 @@ func TestARQ_OutOfOrderReceive(t *testing.T) {
 	a.ReceiveData(0, []byte("packet 0"))
 	<-enqueuer.Packets // ACK for 0
 
-	// Now everything should be readable in order
-	expected := [][]byte{[]byte("packet 0"), []byte("packet 1"), []byte("packet 2")}
-	for _, exp := range expected {
-		buf := make([]byte, 100)
-		_ = localApp.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		n, err := localApp.Read(buf)
-		if err != nil {
-			t.Fatalf("failed to read from local app: %v", err)
-		}
-		if !bytes.Equal(buf[:n], exp) {
-			t.Errorf("expected %s, got %s", string(exp), string(buf[:n]))
-		}
+	// Now everything should be readable in-order as a byte stream. A stream
+	// transport does not preserve per-Write read boundaries, so a single Read
+	// may contain one or more contiguous packets after write coalescing.
+	expected := []byte("packet 0packet 1packet 2")
+	buf := make([]byte, len(expected))
+	_ = localApp.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := io.ReadFull(localApp, buf); err != nil {
+		t.Fatalf("failed to read full ordered payload from local app: %v", err)
+	}
+	if !bytes.Equal(buf, expected) {
+		t.Errorf("expected %s, got %s", string(expected), string(buf))
 	}
 }
 
@@ -1552,6 +1745,53 @@ func TestARQ_WriteLoopRetriesTransientWriteError(t *testing.T) {
 
 	if a.IsClosed() {
 		t.Fatal("expected transient write error not to close stream")
+	}
+}
+
+func TestARQ_WriteLoopFlushesContiguousReceiveBufferInOrder(t *testing.T) {
+	enqueuer := NewMockPacketEnqueuer()
+	cfg := Config{
+		WindowSize: 100,
+		RTO:        0.1,
+		MaxRTO:     0.5,
+	}
+
+	conn := newAggregateWriteConn()
+	a := NewARQ(1, 1, enqueuer, conn, 1000, &testLogger{t}, cfg)
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
+
+	chunks := [][]byte{
+		[]byte("hello "),
+		[]byte("from "),
+		[]byte("arq"),
+	}
+	expected := bytes.Join(chunks, nil)
+
+	a.mu.Lock()
+	start := a.rcvNxt
+	for i, chunk := range chunks {
+		a.rcvBuf[start+uint16(i)] = append([]byte(nil), chunk...)
+	}
+	a.mu.Unlock()
+	a.signalFlushReady()
+
+	if err := conn.waitForBytes(len(expected), time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	writes, _, totalBytes := conn.snapshot()
+	if totalBytes != len(expected) {
+		t.Fatalf("expected %d bytes written, got %d", len(expected), totalBytes)
+	}
+
+	got := make([]byte, 0, totalBytes)
+	for _, write := range writes {
+		got = append(got, write...)
+	}
+
+	if !bytes.Equal(got, expected) {
+		t.Fatalf("expected contiguous write payload %q, got %q", expected, got)
 	}
 }
 
@@ -2353,4 +2593,54 @@ func TestARQ_Backpressure(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("timed out waiting for 9th packet after ACK")
 	}
+}
+
+func BenchmarkARQ_WriteLoopFlushContiguousReceiveBuffer(b *testing.B) {
+	const (
+		chunkCount = 8
+		chunkSize  = 256
+	)
+
+	enqueuer := NewMockPacketEnqueuer()
+	cfg := Config{
+		WindowSize: 128,
+		RTO:        0.1,
+		MaxRTO:     0.5,
+	}
+
+	conn := newAggregateWriteConn()
+	a := NewARQ(1, 1, enqueuer, conn, 4096, nil, cfg)
+	a.Start()
+	defer a.Close("benchmark end", CloseOptions{Force: true})
+
+	chunks := make([][]byte, chunkCount)
+	totalSize := 0
+	for i := range chunks {
+		chunk := bytes.Repeat([]byte{byte('a' + i)}, chunkSize)
+		chunks[i] = chunk
+		totalSize += len(chunk)
+	}
+
+	b.ReportAllocs()
+	b.SetBytes(int64(totalSize))
+	conn.resetMetrics()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		a.mu.Lock()
+		start := a.rcvNxt
+		for j, chunk := range chunks {
+			a.rcvBuf[start+uint16(j)] = chunk
+		}
+		a.mu.Unlock()
+		a.signalFlushReady()
+
+		if err := conn.waitForBytes(totalSize, 2*time.Second); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.StopTimer()
+	_, writeCount, _ := conn.snapshot()
+	b.ReportMetric(float64(writeCount)/float64(b.N), "writes/op")
 }

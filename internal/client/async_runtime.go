@@ -25,10 +25,11 @@ import (
 const clientRXDropLogInterval = 2 * time.Second
 
 type asyncPacket struct {
-	conn       Connection
-	payload    []byte
-	packetType uint8
-	streamID   uint16
+	conn        Connection
+	payload     []byte
+	packetType  uint8
+	streamID    uint16
+	sequenceNum uint16
 }
 
 type asyncReadPacket struct {
@@ -84,8 +85,15 @@ func (c *Client) resetRuntimeBindings(resetSession bool) {
 	c.bumpStreamSetVersion()
 
 	c.dnsResponses = fragmentStore.New[dnsFragmentKey](c.cfg.DNSResponseFragmentStoreCap)
+
 	if c.localDNSCache != nil {
 		c.localDNSCache.ClearPending()
+	}
+
+	if c.socksRateLimit == nil {
+		c.socksRateLimit = newSocksRateLimiter()
+	} else {
+		c.socksRateLimit.Reset()
 	}
 
 	c.closeResolverConnPools()
@@ -231,6 +239,27 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	// 2. Setup session context.
 	runtimeCtx, cancel := context.WithCancel(parentCtx)
 	c.asyncCancel = cancel
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		cancel()
+		if c.tcpListener != nil {
+			c.tcpListener.Stop()
+			c.tcpListener = nil
+		}
+		if c.dnsListener != nil {
+			c.dnsListener.Stop()
+			c.dnsListener = nil
+		}
+		if c.tunnelConn != nil {
+			_ = c.tunnelConn.Close()
+			c.tunnelConn = nil
+		}
+		c.asyncCancel = nil
+		c.resetRuntimeBindings(false)
+	}()
 
 	// 3. Open shared UDP socket.
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
@@ -287,14 +316,14 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	c.asyncWG.Add(1)
 	go c.asyncStreamCleanupWorker(runtimeCtx)
 
-	// 9. Resolver health runtime.
-	if c.cfg.AutoDisableTimeoutServers || c.cfg.RecheckInactiveServersEnabled {
-		c.asyncWG.Add(1)
-		go func() {
-			defer c.asyncWG.Done()
-			c.runResolverHealthLoop(runtimeCtx)
-		}()
-	}
+	// 9. Resolver timeout/health runtime.
+	// Keep this loop always running so resolver timeout samples are still pruned
+	// even when auto-disable and background recheck are disabled.
+	c.asyncWG.Add(1)
+	go func() {
+		defer c.asyncWG.Done()
+		c.runResolverHealthLoop(runtimeCtx)
+	}()
 
 	// 10. Lifecycle cleanup.
 	c.asyncWG.Add(1)
@@ -304,6 +333,7 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 		conn.Close()
 	}()
 
+	started = true
 	return nil
 }
 
@@ -313,12 +343,24 @@ func (c *Client) asyncStreamCleanupWorker(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	fragmentPurgeCounter := 0
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
 			c.cleanupRecentlyClosedStreams(now)
+
+			// Purge stale DNS response fragments every 10 seconds to prevent
+			// memory leaks when no new fragments arrive for a given key.
+			fragmentPurgeCounter++
+			if fragmentPurgeCounter >= 10 {
+				fragmentPurgeCounter = 0
+				if c.dnsResponses != nil {
+					c.dnsResponses.Purge(now, c.cfg.DNSResponseFragmentTimeout())
+				}
+			}
 
 			c.streamsMu.RLock()
 			streams := make([]*Stream_client, 0, len(c.active_streams))
@@ -511,12 +553,12 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr) {
 	if err != nil {
 		if errors.Is(err, DnsParser.ErrTXTAnswerMissing) {
 			receivedAt := time.Now()
-			// summary := DnsParser.DescribeResponseWithoutTunnelPayload(data)
 			if parsed, parseErr := DnsParser.ParsePacketLite(data); parseErr == nil && parsed.Header.RCode != 0 {
 				c.trackResolverFailure(data, addr, receivedAt)
 			} else {
 				c.trackResolverSuccess(data, addr, receivedAt)
 			}
+			// summary := DnsParser.DescribeResponseWithoutTunnelPayload(data)
 			// c.log.Debugf("DNS response from %v had no tunnel TXT payload | %s", addr, summary)
 			return
 		}
@@ -524,12 +566,15 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
-	// packedSummary := ""
-	// if vpnPacket.PacketType == Enums.PACKET_PACKED_CONTROL_BLOCKS {
-	// 	packedSummary = " | " + VpnProto.DescribePackedControlBlocks(vpnPacket.Payload, 4)
-	// }
-	// c.logInboundPacket(vpnPacket.PacketType, vpnPacket.SessionID, len(vpnPacket.Payload), vpnPacket.StreamID, vpnPacket.SequenceNum, vpnPacket.FragmentID, vpnPacket.TotalFragments, packedSummary)
 	c.trackResolverSuccess(data, addr, time.Now())
+	// if c.log != nil && c.log.Enabled(logger.LevelDebug) && vpnPacket.PacketType != Enums.PACKET_PONG {
+	// 	if vpnPacket.PacketType == Enums.PACKET_STREAM_DATA_ACK {
+	// 		c.log.Debugf("Client received ACK | Stream: %d | Seq: %d", vpnPacket.StreamID, vpnPacket.SequenceNum)
+	// 	} else {
+	// 		c.log.Debugf("Client received inbound VPN packet | Packet: %s | Stream: %d | Seq: %d | Payload: %d | Frag: %d/%d",
+	// 			Enums.PacketTypeName(vpnPacket.PacketType), vpnPacket.StreamID, vpnPacket.SequenceNum, len(vpnPacket.Payload), vpnPacket.FragmentID, vpnPacket.TotalFragments)
+	// 	}
+	// }
 
 	// 2. Notify activity monitor (PingManager)
 	c.NotifyPacket(vpnPacket.PacketType, true)

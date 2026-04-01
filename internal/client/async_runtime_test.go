@@ -51,17 +51,33 @@ func TestResetRuntimeBindings(t *testing.T) {
 	c.last_stream_id = 10
 	c.sessionID = 1
 	c.sessionReady = true
+	c.socksRateLimit.RecordFailure("10.0.0.1")
+	oldLimiter := c.socksRateLimit
 
 	c.resetRuntimeBindings(true)
 
 	if c.last_stream_id != 0 {
 		t.Errorf("expected last_stream_id 0, got %d", c.last_stream_id)
 	}
+
 	if c.sessionID != 0 {
 		t.Errorf("expected sessionID 0, got %d", c.sessionID)
 	}
+
 	if c.sessionReady {
 		t.Error("expected sessionReady false")
+	}
+
+	if c.socksRateLimit == nil {
+		t.Fatal("expected socksRateLimit to be reinitialized")
+	}
+
+	if c.socksRateLimit != oldLimiter {
+		t.Fatal("expected socksRateLimit instance to be reset in place")
+	}
+
+	if c.socksRateLimit.IsBlocked("10.0.0.1") {
+		t.Fatal("expected reset to clear prior SOCKS rate-limit state")
 	}
 }
 
@@ -193,6 +209,8 @@ func TestAsyncStreamCleanupWorker(t *testing.T) {
 
 func TestStartAsyncRuntime(t *testing.T) {
 	c := createTestClient(t)
+	c.cfg.ListenIP = "127.0.0.1"
+	c.cfg.ListenPort = 0
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -210,6 +228,72 @@ func TestStartAsyncRuntime(t *testing.T) {
 	}
 
 	c.StopAsyncRuntime()
+}
+
+func TestStartAsyncRuntimeCleansUpOnListenerStartFailure(t *testing.T) {
+	c := createTestClient(t)
+	c.cfg.ListenIP = ""
+	c.cfg.ListenPort = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := c.StartAsyncRuntime(ctx)
+	if err == nil {
+		t.Fatal("expected StartAsyncRuntime to fail for invalid listener address")
+	}
+	if c.asyncCancel != nil {
+		t.Fatal("expected asyncCancel to be cleared after startup failure")
+	}
+	if c.tunnelConn != nil {
+		t.Fatal("expected tunnelConn to be closed after startup failure")
+	}
+}
+
+func TestStartAsyncRuntimeCollectsResolverTimeoutsEvenWhenHealthFeaturesDisabled(t *testing.T) {
+	c := createTestClient(t)
+	c.cfg.ListenIP = "127.0.0.1"
+	c.cfg.ListenPort = 0
+	c.cfg.AutoDisableTimeoutServers = false
+	c.cfg.RecheckInactiveServersEnabled = false
+	c.initResolverRecheckMeta()
+
+	now := time.Now()
+	c.nowFn = func() time.Time {
+		return now
+	}
+
+	addr := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}
+	serverKey := ""
+	if len(c.connections) > 0 {
+		serverKey = c.connections[0].Key
+	}
+	key := resolverSampleKey{
+		resolverAddr: addr.String(),
+		dnsID:        0x1337,
+	}
+
+	c.resolverStatsMu.Lock()
+	c.resolverPending[key] = resolverSample{
+		serverKey: serverKey,
+		sentAt:    now.Add(-10 * time.Second),
+	}
+	c.resolverStatsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := c.StartAsyncRuntime(ctx); err != nil {
+		t.Fatalf("StartAsyncRuntime returned error: %v", err)
+	}
+	defer c.StopAsyncRuntime()
+
+	waitForResolverHealthCondition(t, 3*time.Second, func() bool {
+		c.resolverStatsMu.RLock()
+		sample, ok := c.resolverPending[key]
+		c.resolverStatsMu.RUnlock()
+		return ok && sample.timedOut
+	}, "expected resolver timeout sample to be collected even without auto-disable/recheck enabled")
 }
 
 func TestHandleInboundPacketTreatsMissingTXTAsResolverSuccess(t *testing.T) {

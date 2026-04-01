@@ -1,168 +1,283 @@
-# MasterDnsVPN Project 🚀
+# MasterDnsVPN Project 🔐
 
-## [نسخه فارسی](https://github.com/masterking32/MasterDnsVPN/blob/main/README_FA.MD) | [English Version](https://github.com/masterking32/MasterDnsVPN/blob/main/README.MD) | [Spanish Version](https://github.com/masterking32/MasterDnsVPN/blob/main/README_ES.MD)
+## | [نسخه فارسی](https://github.com/masterking32/MasterDnsVPN/blob/main/README_FA.MD) | [English Version](https://github.com/masterking32/MasterDnsVPN/blob/main/README.MD) |
 
-The **MasterDnsVPN** project is a robust, low-overhead, and advanced DNS tunneling solution that carries TCP traffic inside DNS queries and responses. The current version is fully implemented in **Go**, and its primary optimized path is designed for **SOCKS5 over DNS**.
+**MasterDnsVPN** is a scientific and research-oriented project for carrying TCP traffic through DNS queries and responses. In broad goal, it is similar to projects such as DNSTT or SlipStream, but it follows a fundamentally different structure and implementation approach.
+This system is designed around compatibility with many resolver behaviors and harsh network conditions, with the goal of preserving the highest possible stability and data delivery even in the worst cases.
+Although the overall design is strong, the final quality and speed of the tunnel depend heavily on:
 
-This system is specifically aimed at environments where classic VPN methods or well-known tunnels suffer from severe disruption, high packet loss, strict MTU limits, or aggressive resolver blocking.
+1. Resolver quality and behavior (resolve speed, supported MTU, stability, and more)
+2. Your external server (server latency, connectivity to resolvers, and hardware quality)
+3. Your own internet quality (access speed to resolvers and whether suitable resolvers are reachable)
 
-The main goal of **MasterDnsVPN** is to provide a secure, reliable, and flexible tunnel with minimal protocol overhead and stable behavior even on poor-quality links.
+Like every DNS-based tunnel, MasterDnsVPN is sensitive to these conditions, so real-world performance can vary depending on the environment.
 
----
+### 📊 MasterDnsVPN Compared with Similar Projects
 
-❌ Disclaimer: This project is provided for educational and research purposes only. Its use may conflict with local laws or network policies, and users are solely responsible for how they use it.
-
----
-
-# Announcement Channel 📢
-
-### For the latest news, updates, and changes related to this project, please follow our Telegram channel: [Telegram Channel](https://t.me/masterdnsvpn)
-
----
-
-You can support this project for free by starring the repository on GitHub ⭐
-
-If you want to support it financially, you can use the following channels:
-
-TON: `masterking32.ton`
-
-EVM-compatible blockchains: `0x517f07305D6ED781A089322B6cD93d1461bF8652`
-
-TRC20 chain: `TLApdY8APWkFHHoxebxGY8JhMeChiETqFH`
-
----
-
-## Key Features & Advantages ✨
-
-- **Bypassing strict censorship:** 🛡️ Purpose-built to increase the chance of crossing restrictive firewalls and network policies that block ordinary VPN protocols.
-- **Fully implemented in Go:** ⚙️ The client, server, ARQ layer, queue runtime, resolver balancing, resolver health, and session handling are all implemented in Go in the current version.
-- **Load balancing and resolver diversity:** ⚡ Supports multiple DNS resolvers with random, round-robin, least-loss, and lowest-latency selection strategies using real runtime feedback.
-- **Multipath packet duplication:** 📡 The same packet can be sent through multiple resolvers at once. This increases bandwidth usage, but dramatically improves survivability on lossy links.
-- **Custom protocol and custom ARQ with very low overhead:** 🔄 Instead of QUIC, this project uses its own protocol and ARQ layer. Because of that, packet overhead is kept extremely low and can go down to **7 bytes** in the lightest case.
-- **Resolver health and auto-reactivation:** 🧠 Weak resolvers can be auto-disabled at runtime, rechecked in the background with the synced MTU, and added back once healthy again.
-- **MTU discovery and synchronization:** 🧰 The client probes resolvers, measures upload/download MTU, filters out weak paths, and works on a shared synced MTU.
-- **Dedicated SOCKS5 optimization:** 🧦 The primary runtime path is optimized for SOCKS5, and its setup, ACK flow, and control path are more refined than the generic path.
-- **Packed Control Blocks:** 📦 The server can batch small ACK and control packets together into compact blocks to reduce response count and overhead.
-- **Stream-aware resolver routing:** 🌐 Each stream can keep a preferred resolver and fail over in a controlled way after repeated resends.
-- **Compression and small-packet packing:** 🗜️ Optional compression and batching help reduce request count and make better use of each MTU.
-- **Strong and flexible encryption:** 🔐 Supports `XOR`, `ChaCha20`, `AES-128-GCM`, `AES-192-GCM`, and `AES-256-GCM`.
-- **Optional local DNS on the client:** 📛 The client can expose a local DNS service and forward local DNS queries through the tunnel if needed.
+| Feature | SlipStream | DNSTT | MasterDnsVPN |
+| :--- | :--- | :--- | :--- |
+| Protocol type | Advanced DNS tunnel | Classic DNS tunnel | Advanced DNS tunnel / VPN |
+| Transport protocol | QUIC | KCP + Noise | Custom protocol + ARQ |
+| Transport header overhead | 🟠 ~24B | 🔴 ~59B | 🟢 ~5–7B (≈88% lower than DNSTT, ≈71% lower than SlipStream) |
+| Encryption style | TLS 1.3 (inside QUIC) | Noise (Curve25519) | AES / ChaCha20 / XOR (if XOR is used: lightweight with lower security and no extra overhead) |
+| Architecture | Unified (QUIC handles everything) | Multi-layered (KCP + SMUX + Noise) | Lightweight custom design optimized for DNS |
+| Performance (speed) | 🟡 High (up to ~5× faster than DNSTT) | 🔴 Medium | 🟢 Works well in very poor conditions; often performs better in practice |
+| Stability under packet loss | 🟡 Good | 🟠 Medium | 🟢 Very high (Multipath + ARQ) |
+| Multi-resolver support | Yes (multipath) | ❌ | Yes — advanced (multi-resolver + duplication) |
+| Resilience under heavy censorship | Good | Medium | Very strong (a core project goal) |
+| Setup complexity | Medium | Simple | Simple by default, but highly configurable and therefore a bit more advanced |
+| SOCKS5 support | Yes | Yes | Optimized for SOCKS5 / SOCKS4 |
+| Shadowsocks support | ✅ | ❌ | Indirectly: TCP Forwarding mode can carry TCP-based protocols |
+| Real multipath | Yes (QUIC multipath) | ❌ | Yes (multi-resolver + duplication) |
+| Adaptive routing | Limited | ❌ | Advanced (latency/loss based) |
+| Design goal | High speed and efficiency | Simplicity and stability | Surviving the harshest networks — stability, speed, and efficiency |
+| Implementation language | Rust | Go | Python and Go |
+| Built-in balancer | 🔴 | ❌ | 🟢 (4 built-in balancing modes) |
+| Duplication system | ❌ | ❌ | Yes — increases traffic to improve reliability (configurable) |
+| MTU tolerance | Better than DNSTT | - | Works even with very small MTU because protocol overhead is very low |
+| Failover system | ❌ | ❌ | ✅ |
+| Resolver health checks and auto-disable | ❌ | ❌ | ✅ |
+| Background reactivation of healthy resolvers | ❌ | ❌ | ✅ |
+| Local DNS service on client (to reduce DNS hijacking) | ❌ | ❌ | ✅ (with strong DNS caching) |
+| DNS resolving through SOCKS5 | ❌ | ❌ | ✅ (with DNS caching) |
+| Fine-grained professional configuration | 🟠 | 🟠 | 🟢 Almost every subsystem is configurable |
+| No external helper software required | ❌ | ❌ | 🟢 No extra software is required; if needed, you can still combine it with SOCKS or tools such as Shadowsocks or OpenVPN |
 
 ---
 
-# Setup Guide 🧑‍💻
+### ❌ Disclaimer
 
-## Section 1: Network Prerequisites (DNS Configuration) 🛠️
+MasterDnsVPN is provided as an educational and research project only.
 
-For your server to receive and process DNS queries directly, you must delegate a subdomain to your own server. Open your DNS management panel and create the following two records:
+- **Provided without warranty:** This software is provided “AS-IS”, without any express or implied warranty, including merchantability, fitness for a particular purpose, or non-infringement.
+- **Limitation of liability:** The developers and contributors of this project accept no responsibility for any direct, indirect, incidental, consequential, or other damages arising from the use of this software or the inability to use it.
+- **User responsibility:** Using this project outside test environments may disrupt or damage network behavior. The user alone is responsible for all consequences of installation, configuration, and use.
+- **Legal compliance:** Using this project to bypass local laws may result in civil or criminal consequences. Please review the laws and regulations of your country before use. The developers accept no responsibility for violations of local, national, or international laws by users.
+- **License terms:** Use, copying, distribution, or modification of this software is governed by the license in the `LICENSE` file of this repository. Any use outside those terms is prohibited.
 
-### Step 1.1: Create an A Record (Server IP) 🅰️
+---
 
-- **Record Type:** `A`
-- **Name:** a short arbitrary name such as `ns`
-- **IPv4 Address:** your server IP
+## Announcement and Support Channel 📢
 
-> **Result:** `ns.example.com -> 1.2.3.4`
+For the latest news, releases, and project updates, follow our Telegram channel: [Telegram Channel](https://t.me/masterdnsvpn)
 
-### Step 1.2: Create an NS Record (Tunnel Subdomain) 🏷️
+---
 
-- **Record Type:** `NS`
+### If you like this project, please support it by starring it on GitHub (⭐). It helps the project get discovered.
+
+---
+
+### Optional Financial Support 💸
+
+- TON network:
+
+`masterking32.ton`
+
+- EVM-compatible networks (ETH and compatible chains):
+
+`0x517f07305D6ED781A089322B6cD93d1461bF8652`
+
+- TRC20 network (TRON):
+
+`TLApdY8APWkFHHoxebxGY8JhMeChiETqFH`
+
+Every contribution and every piece of feedback is appreciated. Support directly helps ongoing development and improvement.
+
+---
+
+## Key Features and Advantages ✨
+
+A brief overview of the main capabilities of MasterDnsVPN:
+
+- **Censorship resistance and harsh-network survivability:** 🛡️ Designed to work on filtered networks, unstable links, and strict MTU environments.
+- **Lightweight custom protocol:** 🔄 Uses a custom protocol with retransmission logic to reduce overhead and increase usable DNS payload.
+- **Multipath and packet duplication:** 📡 Sends traffic through multiple paths and supports selective duplication to increase delivery probability on unstable networks.
+- **Smart resolver selection and health checks:** ⚡ Selects resolvers based on quality and health, and manages problematic resolvers automatically.
+- **MTU discovery and synchronization:** 🧰 Detects the practical MTU of working paths and aligns around it to reduce fragmentation and improve stability.
+- **SOCKS5 / SOCKS4 support and optimization:** 🧦 Optimized local proxy handling for common applications.
+- **Packed control blocks and lower control overhead:** 📦 Groups ACK/control traffic together to reduce control chatter.
+- **Optional compression and request packing:** 🗜️ Reduces request counts and improves efficiency under small-MTU conditions.
+- **Flexible encryption:** 🔐 Supports multiple encryption methods to balance speed and security.
+- **Optional client-side local DNS and caching:** 📛 Can expose a local DNS service, reduce latency, and limit hijacking opportunities.
+- **Scalable resource control:** ⚙️ Can run on small servers or be tuned for heavier loads.
+
+This list is only a high-level summary. The related sections below explain each area in more detail.
+
+---
+
+# Setup and Getting Started 🧑‍💻
+
+## Section 1: 🖥️ Server Setup
+
+### Section 1.1: 🌐 Domain Setup and Preparation (Prerequisite)
+
+To receive DNS requests directly on your server, you must delegate a subdomain to it. In short, create two records: one `A` record that points to your server IP, and one `NS` record that delegates the tunnel subdomain to that A record.
+
+#### Step 1.1.1: 🅰️ Create an A Record (Server Address)
+
+- **Type:** `A`
+- **Name:** a short name such as `ns`
+- **Value:** your server IPv4 address
+
+> Example: `ns.example.com -> 1.2.3.4`
+
+> Cloudflare note: if the domain uses Cloudflare, open the `DNS` page and click the cloud icon next to the `A` record so it becomes gray (`DNS only`). It must not remain proxied.
+
+#### Step 1.1.2: 🏷️ Create an NS Record (Delegate the Subdomain)
+
+- **Type:** `NS`
 - **Name:** the tunnel subdomain, for example `v`
-- **Target / Nameserver:** the A record from the previous step
+- **Value / Target:** `ns.example.com`
 
-> **Result:** `v.example.com -> ns.example.com`
+> Example: `v.example.com -> ns.example.com`
 
----
+> Cloudflare note: add the `NS` record normally. Cloudflare does not proxy NS records, but make sure the `ns` A record is already set to `DNS only`.
 
-## Section 1.3: Important Warning for Cloudflare Users ⚠️
+#### Section 1.1.3: 💡 A Short Note About MTU
 
-If you use Cloudflare, the `A` record for your nameserver **must** be set to **DNS only**. If proxying is enabled, UDP port `53` will not pass through and the tunnel will not work.
-
-## Section 1.4: Golden Tip for Better Speed (MTU) 💡
-
-In DNS, domain length consumes part of the limited payload space of each request. The shorter your domain and labels are, the more room remains for actual data.
+Shorter domain names leave more space for actual data inside each DNS request. For better throughput, keep names short. If you use Cloudflare, still keep the relevant records in `DNS only` mode.
 
 ---
 
-## Section 2: Installation and Execution (Client and Server) 🚀
+### Section 1.2: 🐧 Quick Linux Server Installation
 
-You can run this project in two ways:
+#### Step 1.2.1: Automatic Installation (Script)
 
-1. Use the prebuilt binaries
-2. Build and run directly from the **Go** source
-
-### Step 2.1: Quick Linux Server Setup 🐧
-
-If you want to set up the server on a Linux machine, the easiest way is using the automated installation script. Run the following command in your server terminal:
+If you want to deploy the server on Linux, the easiest method is the automatic installer script. Run this command on the server:
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh)
 ```
 
-This command downloads the installer from GitHub and performs the server installation and configuration automatically. When the setup finishes, the server starts and prints the **Encryption Key** in the terminal logs. Copy this key, because you will need it on the client side. It is also stored in `encrypt_key.txt` next to the server executable.
+The script handles installation and configuration automatically. When it finishes, the server starts and the **encryption key** is shown in the terminal log and also written to `encrypt_key.txt` next to the executable. Keep this key safe.
 
-> ⚠️ **Important Note 1:** Before running this script, you must own a domain and complete the DNS setup from Section 1.
->
-> ⚠️ **Important Note 2:** This script installs the Linux server only. To run the client on your own machine, use Step 2.2 below.
->
-> ⚠️ **Important Note 3:** You can also use this script for updates. Running it again after a new release will update the server automatically.
+#### Step 1.2.2: Important Notes After Installation
+
+- During installation, you will be asked for a domain. It must be the same delegated subdomain you configured in the `NS` record, for example `v.example.com`.
+- After creating DNS records, wait for propagation. This may take from a few minutes to several hours, and in some cases up to 48 hours depending on TTL and the DNS provider.
+- To verify the DNS setup, you can use tools such as `dig` or `nslookup`, for example `dig v.example.com NS` or `nslookup -type=ns v.example.com`. For a direct query to the new nameserver: `dig @ns.example.com v.example.com A`.
+- If the server firewall is enabled, allow UDP port 53. Example for `ufw`:
+
+```bash
+sudo ufw allow 53/udp
+sudo ufw reload
+```
+
+For `firewalld`:
+
+```bash
+sudo firewall-cmd --add-port=53/udp --permanent
+sudo firewall-cmd --reload
+```
+
+- If port `53` is already occupied by another service, such as `systemd-resolved`, see the troubleshooting section “Fixing Port 53 Already in Use”.
+- The encryption key (`encrypt_key.txt`) is shown after installation. Copy it and store it safely because the client needs it to connect.
 
 ---
 
-### Step 2.2: Use the Prebuilt Binaries (Recommended ✅)
+## Section 2: 🚀 Installation and Launch (Client and Server)
 
-For convenience, the client and server binaries are published in the release page. Download the correct build for your operating system and extract it.
+You can install and run this project in two ways:
 
-> 💡 **Note:** Release archives usually include the executable and sample config files.
+1. Use the prebuilt binaries (recommended for most users)
+2. Run directly from source with **Go** (recommended for developers)
+
+---
+
+### Section 2.1: Use Prebuilt Releases (✅ Recommended)
+
+For convenience, prebuilt client and server binaries are published in the release page. Download the correct archive for your operating system and extract it.
+
+> 💡 **Note:** Release archives usually include the binary plus sample configuration files.
 
 #### Client Download Links 📥
 
 | Operating System | Architecture | Suitable For | Direct Download |
 | :--- | :--- | :--- | :--- |
 | Windows 🪟 | `AMD64` (64-bit) | Windows 10 and 11 | [Download Windows Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Windows_AMD64.zip) |
+| Windows 🪟 | `x86` (32-bit) | Older 32-bit Windows systems | [Download Windows x86 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Windows_X86.zip) |
+| Windows 🪟 | `ARM64` | Windows on ARM devices | [Download Windows ARM64 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Windows_ARM64.zip) |
 | macOS 🍎 | `ARM64` | Apple Silicon Macs (M1 / M2 / M3) | [Download macOS Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_MacOS_ARM64.zip) |
-| Linux 🐧 | `AMD64` (64-bit) | Modern distros (Ubuntu 22.04+, Debian 12+) | [Download Linux Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_AMD64.zip) |
-| Linux Legacy 🐧 | `AMD64` (64-bit) | Older distros (Ubuntu 20.04, Debian 11) | [Download Linux Legacy Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux-Legacy_AMD64.zip) |
-| Linux ARM 🐧 | `ARM64` | ARM servers, Raspberry Pi, similar boards | [Download Linux ARM Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_ARM64.zip) |
+| macOS 🍎 | `AMD64` | Intel Macs | [Download macOS Intel Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_MacOS_AMD64.zip) |
+| Linux 🐧 | `AMD64` (64-bit) | Modern distributions (Ubuntu 22.04+, Debian 12+) | [Download Linux Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_AMD64.zip) |
+| Linux 🐧 | `x86` (32-bit) | Older 32-bit Linux systems | [Download Linux x86 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_X86.zip) |
+| Linux (Legacy) 🐧 | `AMD64` (64-bit) | Older distributions (Ubuntu 20.04, Debian 11) | [Download Linux Legacy Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux-Legacy_AMD64.zip) |
+| Linux (Legacy) 🐧 | `ARM64` | Older ARM64 Linux systems that need broader compatibility | [Download Linux Legacy ARM64 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux-Legacy_ARM64.zip) |
+| Linux (ARM) 🐧 | `ARM64` | ARM servers, Raspberry Pi, and similar boards | [Download Linux ARM Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_ARM64.zip) |
+| Linux (ARM) 🐧 | `ARMv7` | 32-bit ARM boards and older embedded Linux devices | [Download Linux ARMv7 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_ARMV7.zip) |
+| Linux (ARM) 🐧 | `ARMv6` | Older ARM boards and lightweight Linux devices | [Download Linux ARMv6 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_ARMV6.zip) |
+| Linux (ARM) 🐧 | `ARMv5` | Very old ARM devices and embedded Linux systems | [Download Linux ARMv5 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_ARMV5.zip) |
+| Linux 🐧 | `RISCV64` | RISC-V Linux boards and servers | [Download Linux RISCV64 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_RISCV64.zip) |
+| Linux (MIPS) 🐧 | `MIPS` | Big-endian MIPS Linux and router platforms | [Download Linux MIPS Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_MIPS.zip) |
+| Linux (MIPS) 🐧 | `MIPSLE` | Little-endian MIPS Linux and router platforms | [Download Linux MIPSLE Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_MIPSLE.zip) |
+| Linux (MIPS) 🐧 | `MIPS64` | 64-bit big-endian MIPS Linux systems | [Download Linux MIPS64 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_MIPS64.zip) |
+| Linux (MIPS) 🐧 | `MIPS64LE` | 64-bit little-endian MIPS Linux systems | [Download Linux MIPS64LE Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Linux_MIPS64LE.zip) |
+| Termux / Android 📱 | `ARM64` | Modern Android phones running Termux | [Download Termux ARM64 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Termux_ARM64.zip) |
+| Termux / Android 📱 | `ARMv7` | Older Android phones running 32-bit Termux environments | [Download Termux ARMv7 Client ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Client_Termux_ARMV7.zip) |
 
 #### Server Download Links 📤
 
-*(Use these builds when you do not want to use the automated Linux installer.)*
+*(Use these if you do not want the automated Linux installer.)*
 
 | Operating System | Architecture | Suitable For | Direct Download |
 | :--- | :--- | :--- | :--- |
 | Windows 🪟 | `AMD64` (64-bit) | Windows Server, Windows 10 and 11 | [Download Windows Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Windows_AMD64.zip) |
+| Windows 🪟 | `x86` (32-bit) | Older 32-bit Windows systems | [Download Windows x86 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Windows_X86.zip) |
+| Windows 🪟 | `ARM64` | Windows on ARM devices | [Download Windows ARM64 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Windows_ARM64.zip) |
 | Linux 🐧 | `AMD64` (64-bit) | Ubuntu 22.04+, Debian 12+ servers | [Download Linux Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_AMD64.zip) |
-| Linux Legacy 🐧 | `AMD64` (64-bit) | Older servers (Ubuntu 20.04, Debian 11) | [Download Linux Legacy Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux-Legacy_AMD64.zip) |
-| Linux ARM 🐧 | `ARM64` | ARM servers | [Download Linux ARM Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_ARM64.zip) |
+| Linux 🐧 | `x86` (32-bit) | Older 32-bit Linux systems | [Download Linux x86 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_X86.zip) |
+| Linux (Legacy) 🐧 | `AMD64` (64-bit) | Older servers (Ubuntu 20.04, Debian 11) | [Download Linux Legacy Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux-Legacy_AMD64.zip) |
+| Linux (Legacy) 🐧 | `ARM64` | Older ARM64 Linux systems that need broader compatibility | [Download Linux Legacy ARM64 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux-Legacy_ARM64.zip) |
+| Linux (ARM) 🐧 | `ARM64` | ARM servers | [Download Linux ARM Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_ARM64.zip) |
+| Linux (ARM) 🐧 | `ARMv7` | 32-bit ARM servers and embedded Linux devices | [Download Linux ARMv7 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_ARMV7.zip) |
+| Linux (ARM) 🐧 | `ARMv6` | Older ARM boards and lightweight Linux devices | [Download Linux ARMv6 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_ARMV6.zip) |
+| Linux (ARM) 🐧 | `ARMv5` | Very old ARM devices and embedded Linux systems | [Download Linux ARMv5 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_ARMV5.zip) |
+| Linux 🐧 | `RISCV64` | RISC-V Linux boards and servers | [Download Linux RISCV64 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_RISCV64.zip) |
+| Linux (MIPS) 🐧 | `MIPS` | Big-endian MIPS Linux and router platforms | [Download Linux MIPS Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_MIPS.zip) |
+| Linux (MIPS) 🐧 | `MIPSLE` | Little-endian MIPS Linux and router platforms | [Download Linux MIPSLE Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_MIPSLE.zip) |
+| Linux (MIPS) 🐧 | `MIPS64` | 64-bit big-endian MIPS Linux systems | [Download Linux MIPS64 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_MIPS64.zip) |
+| Linux (MIPS) 🐧 | `MIPS64LE` | 64-bit little-endian MIPS Linux systems | [Download Linux MIPS64LE Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Linux_MIPS64LE.zip) |
 | macOS 🍎 | `ARM64` | Apple Silicon Macs | [Download macOS Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_MacOS_ARM64.zip) |
+| macOS 🍎 | `AMD64` | Intel Macs | [Download macOS Intel Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_MacOS_AMD64.zip) |
+| Termux / Android 📱 | `ARM64` | Modern Android / Termux environments | [Download Termux ARM64 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Termux_ARM64.zip) |
+| Termux / Android 📱 | `ARMv7` | Older Android / 32-bit Termux environments | [Download Termux ARMv7 Server ⬇️](https://github.com/masterking32/MasterDnsVPN/releases/latest/download/MasterDnsVPN_Server_Termux_ARMV7.zip) |
 
 ---
 
-### Step 2.2.1: Prepare and Run on Linux 🗂️
+### Section 2.2: 🪟 Preparing and Running the Client on Windows
 
-After downloading the ZIP file on Linux:
+- After downloading the Windows package, extract it.
+- Open `client_config.toml` with a text editor such as Notepad.
+- Replace the default values with your real domain, encryption key, and resolver list.
+- Run the client executable.
+- Configure your browser or app to use the local SOCKS5 proxy at `127.0.0.1:18000` unless you changed the defaults.
+
+---
+
+### Section 2.3: 🐧 Preparing and Running on Linux / macOS
+
+After downloading the package on Linux:
 
 ```bash
 sudo apt update
 sudo apt install unzip nano
 ```
 
-Extract it:
+Extract the archive:
 
 ```bash
 unzip MasterDnsVPN_Client_Linux_AMD64.zip
 ls
 ```
 
-Grant execute permissions if needed:
+Give execute permission if needed:
 
 ```bash
 chmod +x MasterDnsVPN_Client_Linux_AMD64
 chmod +x MasterDnsVPN_Server_Linux_AMD64
 ```
 
-Edit your config files:
+Edit the configuration:
 
 ```bash
 nano client_config.toml
@@ -178,9 +293,9 @@ Then run:
 
 ---
 
-### Step 2.3: Build and Run from Source (Current Go Version) 🧑‍💻
+### Section 2.4: 🧑‍💻 Run Directly from Source (Go)
 
-> ⚠️ **Note:** This section is intended for developers or users who want to run the current Go source directly.
+> ⚠️ This section is intended for developers or users who want to run the current Go source directly.
 
 #### Prerequisite
 
@@ -240,7 +355,7 @@ On Windows:
 
 #### Command-line parameters
 
-Both binaries support these parameters:
+Both binaries support these arguments:
 
 | Parameter | Description |
 | :--- | :--- |
@@ -257,7 +372,7 @@ Example:
 
 ---
 
-# Section 3: Configuration Files Structure 🛠️
+# Section 3: Configuration Files and Structure 🛠️
 
 ## Section 3.1: Important Project Files 📂
 
@@ -266,9 +381,9 @@ Example:
 | `client_config.toml` | Main client configuration |
 | `server_config.toml` | Main server configuration |
 | `client_resolvers.txt` | Resolver list |
-| `encrypt_key.txt` | Shared server-side key |
-| `client_config.toml.simple` | Complete sample client config for the current Go version |
-| `server_config.toml.simple` | Complete sample server config for the current Go version |
+| `encrypt_key.txt` | Shared server-side encryption key |
+| `client_config.toml.simple` | Full sample client config for the current Go version |
+| `server_config.toml.simple` | Full sample server config for the current Go version |
 
 Accepted formats in `client_resolvers.txt`:
 
@@ -288,305 +403,363 @@ Example:
 
 ---
 
-## Section 3.2: Quick Client Configuration 🚀
+## Section 3.2: Quick Client Checklist 🚀
 
 These items are required on the client:
 
-1. **`ENCRYPTION_KEY`** must match the content of the server's `encrypt_key.txt`
-2. **`DOMAINS`** must match the server `DOMAIN`
-3. **`client_resolvers.txt`** must contain valid resolvers
+1. **`ENCRYPTION_KEY`** must match the content of the server’s `encrypt_key.txt`
+2. **`DOMAINS`** must match the server domain
+3. **`client_resolvers.txt`** must contain working resolvers
 4. For normal use, keep **`PROTOCOL_TYPE = "SOCKS5"`**
 
 ---
 
-## Section 3.3: Quick Server Configuration ⚙️
+## Section 3.3: Quick Server Checklist ⚙️
 
-These server settings are critical:
+These settings are critical on the server:
 
-1. Set **`DOMAIN`** to your delegated domain
+1. Set **`DOMAIN`** to your delegated tunnel domain
 2. **`DATA_ENCRYPTION_METHOD`** must match the client
-3. **`ENCRYPTION_KEY_FILE`** defines the server key file path
+3. **`ENCRYPTION_KEY_FILE`** defines the path to the server key file
 4. If you want direct outbound connections, keep **`USE_EXTERNAL_SOCKS5 = false`**
-5. If you want to chain through an upstream SOCKS5, set `USE_EXTERNAL_SOCKS5 = true` and fill `FORWARD_IP` / `FORWARD_PORT`
+5. If you want to chain through an upstream SOCKS5 proxy, set `USE_EXTERNAL_SOCKS5 = true` and fill `FORWARD_IP` / `FORWARD_PORT`
 
 ---
 
-## Section 3.4: Client Configuration Variables (`client_config.toml`) 📖
+## Section 3.4: 📘 Client Configuration Variables (`client_config.toml`)
 
-### Tunnel Identity and Security
+### 3.4.1) 🧭 Tunnel Identity and Security
 
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `DOMAINS` | `["v.domain.com"]` | String list | Domains used to build tunnel queries. Must match the server domain. |
-| `DATA_ENCRYPTION_METHOD` | `1` | `0` to `5` | `0=None`, `1=XOR`, `2=ChaCha20`, `3=AES-128-GCM`, `4=AES-192-GCM`, `5=AES-256-GCM` |
-| `ENCRYPTION_KEY` | `""` | String | Shared key between client and server |
+| `PROTOCOL_TYPE` | `"SOCKS5"` | `"SOCKS5"` or `"TCP"` | Chooses the local service mode exposed by the client.<br>`SOCKS5` is the default and recommended mode for normal use.<br>`TCP` is useful when you want to forward traffic to one fixed remote target instead of giving applications a SOCKS proxy. |
+| `DOMAINS` | `["v.example.com"]` | Non-empty list of strings | These are the tunnel domains used to build DNS requests.<br>Every domain here must belong to the same tunnel you configured on the server.<br>If this list is wrong, the client may build valid DNS queries that the server will simply ignore. |
+| `DATA_ENCRYPTION_METHOD` | `1` | `0..5` | Must match the server.<br>`0=None`, `1=XOR`, `2=ChaCha20`, `3=AES-128-GCM`, `4=AES-192-GCM`, `5=AES-256-GCM`.<br>XOR is lightweight but weaker. AEAD modes are stronger but have more overhead. |
+| `ENCRYPTION_KEY` | `""` | String | Shared secret used by the client codec.<br>This must be exactly the same as the server-side encryption key.<br>If the key is wrong, packets may be parsed as garbage and the tunnel will not work. |
 
-### Local Proxy
+### 3.4.2) 🧦 Local Proxy
 
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `PROTOCOL_TYPE` | `"SOCKS5"` | `"SOCKS5"`, `"TCP"` | `SOCKS5` is the main and recommended mode |
-| `LISTEN_IP` | `"127.0.0.1"` | Valid IP | Local proxy bind address |
-| `LISTEN_PORT` | `18000` | Valid port | Local proxy port |
-| `SOCKS5_AUTH` | `false` | `true/false` | Enables authentication on the local proxy |
-| `SOCKS5_USER` | `"master_dns_vpn"` | String | Proxy username |
-| `SOCKS5_PASS` | `"master_dns_vpn"` | String | Proxy password |
+| `LISTEN_IP` | `"127.0.0.1"` | Valid IP string | Address where the client listens for local proxy users.<br>Use `127.0.0.1` for normal local-only usage.<br>If some applications prefer IPv6 localhost on your system, using `localhost` can be a better local-only choice.<br>Use `0.0.0.0` only if you want to share the proxy on the network and understand the security implications. |
+| `LISTEN_PORT` | `18000` | `0..65535` | Port for the local proxy.<br>Your applications must use this port to send traffic into the tunnel. |
+| `SOCKS5_AUTH` | `false` | `true/false` | Enables username/password authentication on the local SOCKS5 proxy.<br>If you bind to `0.0.0.0`, enabling this is strongly recommended. |
+| `SOCKS5_USER` | `"master_dns_vpn"` | Up to 255 bytes | Username for the local SOCKS5 proxy.<br>Used only if `SOCKS5_AUTH=true`. |
+| `SOCKS5_PASS` | `"master_dns_vpn"` | Up to 255 bytes | Password for the local SOCKS5 proxy.<br>Used only if `SOCKS5_AUTH=true`. |
 
-### Local DNS
+### 3.4.3) 📛 Local DNS
 
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `LOCAL_DNS_ENABLED` | `false` | `true/false` | Enables a local DNS service on the client |
-| `LOCAL_DNS_IP` | `"127.0.0.1"` | Valid IP | Local DNS bind address |
-| `LOCAL_DNS_PORT` | `53` | Valid port | Local DNS port |
-| `LOCAL_DNS_CACHE_MAX_RECORDS` | `10000` | Positive integer | Local DNS cache limit |
-| `LOCAL_DNS_CACHE_TTL_SECONDS` | `14400.0` | Positive number | Local DNS cache TTL |
-| `LOCAL_DNS_PENDING_TIMEOUT_SECONDS` | `300.0` | Positive number | Timeout for locally pending DNS requests |
-| `DNS_RESPONSE_FRAGMENT_TIMEOUT_SECONDS` | `60.0` | Positive number | Timeout for reassembling fragmented DNS tunnel responses |
-| `LOCAL_DNS_CACHE_PERSIST_TO_FILE` | `true` | `true/false` | Persists local DNS cache to disk |
-| `LOCAL_DNS_CACHE_FLUSH_INTERVAL_SECONDS` | `60.0` | Positive number | Flush interval for persisted local DNS cache |
+| `LOCAL_DNS_ENABLED` | `false` | `true/false` | If enabled, the client exposes a local DNS service and can resolve DNS through the tunnel.<br>This is useful for reducing DNS hijacking or when you want applications to use the tunnel for DNS as well. |
+| `LOCAL_DNS_IP` | `"127.0.0.1"` | Valid IP string | Bind address for the local DNS listener. |
+| `LOCAL_DNS_PORT` | `53` | `0..65535` | Port of the local DNS service.<br>Port `53` is standard, but on some systems it may already be used by another service. |
+| `LOCAL_DNS_CACHE_MAX_RECORDS` | `5000` | If `<1`, fallback applies | Maximum number of local DNS cache records.<br>A larger value reduces repeated DNS lookups but uses more memory. |
+| `LOCAL_DNS_CACHE_TTL_SECONDS` | `28800.0` | If `<=0`, fallback applies | How long successful DNS records stay in the local cache. |
+| `LOCAL_DNS_PENDING_TIMEOUT_SECONDS` | `300.0` | If `<=0`, fallback applies | If a local DNS query is in progress, follower queries can wait for it instead of launching another upstream request.<br>This value defines how long they may wait. |
+| `LOCAL_DNS_CACHE_PERSIST_TO_FILE` | `true` | `true/false` | If enabled, the local DNS cache can be written to disk for reuse between runs. |
+| `LOCAL_DNS_CACHE_FLUSH_INTERVAL_SECONDS` | `60.0` | If `<=0`, fallback applies | How often the persisted local DNS cache is flushed to disk. |
+| `DNS_RESPONSE_FRAGMENT_TIMEOUT_SECONDS` | `10.0` | If `<=0`, fallback applies | How long the client waits for missing DNS tunnel response fragments before giving up. |
 
-### Resolver Selection, Duplication, and Health
+### 3.4.4) ⚡ Resolver Selection, Duplication, Health, and Failover
 
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `RESOLVER_BALANCING_STRATEGY` | `0` | `0` to `4` | `0/2=Round Robin`, `1=Random`, `3=Least Loss`, `4=Lowest Latency` |
-| `PACKET_DUPLICATION_COUNT` | `2` | `1` to `8` | Normal outgoing packet duplication count |
-| `SETUP_PACKET_DUPLICATION_COUNT` | `2` | `1` to `8` | Setup packet duplication count |
-| `STREAM_RESOLVER_FAILOVER_RESEND_THRESHOLD` | `2` | Positive integer | Failover threshold for a stream's preferred resolver |
-| `STREAM_RESOLVER_FAILOVER_COOLDOWN` | `1.0` | Positive number | Minimum delay between two failovers |
-| `RECHECK_INACTIVE_SERVERS_ENABLED` | `true` | `true/false` | Background recheck of inactive resolvers |
-| `RECHECK_INACTIVE_INTERVAL_SECONDS` | `60.0` | Positive number | Full recheck cycle interval |
-| `RECHECK_SERVER_INTERVAL_SECONDS` | `3.0` | Positive number | Delay between individual rechecks |
-| `RECHECK_BATCH_SIZE` | `5` | Positive integer | Number of resolvers checked per batch |
-| `AUTO_DISABLE_TIMEOUT_SERVERS` | `true` | `true/false` | Runtime auto-disable for timeout-only resolvers |
-| `AUTO_DISABLE_TIMEOUT_WINDOW_SECONDS` | `60.0` | Positive number | Time window for timeout-only auto-disable |
-| `AUTO_DISABLE_MIN_OBSERVATIONS` | `6` | Positive integer | Minimum observations before auto-disable |
-| `AUTO_DISABLE_CHECK_INTERVAL_SECONDS` | `3.0` | Positive number | Evaluation interval for auto-disable |
-| `BASE_ENCODE_DATA` | `false` | `true/false` | Base-safe encodes payload before tunneling |
+| `RESOLVER_BALANCING_STRATEGY` | `0` | `0..4` | Chooses how resolvers are selected.<br>`0/2` = Round Robin, `1` = Random, `3` = Least Loss, `4` = Lowest Latency.<br>Loss/latency modes become useful after the client gathers runtime statistics. |
+| `PACKET_DUPLICATION_COUNT` | `5` | clamp to valid range in code | Normal outgoing packet duplication count.<br>Higher values increase traffic cost but improve survivability on weak links. |
+| `SETUP_PACKET_DUPLICATION_COUNT` | `5` | clamp to valid range in code | Similar to `PACKET_DUPLICATION_COUNT`, but used for setup-sensitive packets such as stream creation and other critical control events. |
+| `STREAM_RESOLVER_FAILOVER_RESEND_THRESHOLD` | `2` | If `<1`, fallback applies | If a stream accumulates repeated resend pressure on the same preferred resolver, the client may fail over that stream to another resolver.<br>This threshold controls how quickly that happens. |
+| `STREAM_RESOLVER_FAILOVER_COOLDOWN` | `1.0` | If `<=0`, fallback applies | Minimum delay between two failovers for the same stream.<br>This prevents unstable oscillation between resolvers. |
+| `RECHECK_INACTIVE_SERVERS_ENABLED` | `true` | `true/false` | Enables background rechecks for currently disabled or unhealthy resolvers.<br>If disabled, once a resolver becomes unusable, it will stay disabled until restart or manual rebuild. |
+| `RECHECK_INACTIVE_INTERVAL_SECONDS` | `1800.0` | If `<=0`, fallback applies | Base interval used for rechecking inactive resolvers in the background. |
+| `RECHECK_SERVER_INTERVAL_SECONDS` | `3.0` | If `<=0`, fallback applies | Shorter retry interval used for resolvers disabled during runtime health logic.<br>This makes recently bad resolvers come back faster if they recover. |
+| `RECHECK_BATCH_SIZE` | `5` | If `<1`, fallback to `1` | Maximum number of resolver rechecks launched in one pass.<br>Higher values reactivate resolvers faster but use more background work. |
+| `AUTO_DISABLE_TIMEOUT_SERVERS` | `true` | `true/false` | Enables automatic disabling of resolvers that keep timing out and show no successful activity. |
+| `AUTO_DISABLE_TIMEOUT_WINDOW_SECONDS` | `180.0` | If `<=0`, fallback applies | Time window used to decide whether a resolver is “timeout only”.<br>If all observations in this window are timeouts, it may be disabled. |
+| `AUTO_DISABLE_MIN_OBSERVATIONS` | `6` | minimum `1` | Number of timeout observations required before auto-disable can trigger. |
+| `AUTO_DISABLE_CHECK_INTERVAL_SECONDS` | `3.0` | If `<=0`, fallback applies | How often the health loop evaluates timeout-only resolvers for auto-disable. |
+| `BASE_ENCODE_DATA` | `false` | `true/false` | If enabled, payloads are encoded in a base-safe format before tunneling.<br>This usually reduces payload efficiency, but can help in strict resolver environments. |
 
-### Compression
+### 3.4.5) 🗜️ Compression
 
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `UPLOAD_COMPRESSION_TYPE` | `0` | `0` to `3` | `0=OFF`, `1=ZSTD`, `2=LZ4`, `3=ZLIB` |
-| `DOWNLOAD_COMPRESSION_TYPE` | `0` | `0` to `3` | Download compression type |
-| `COMPRESSION_MIN_SIZE` | `120` | Positive integer | Minimum payload size before compression |
+| `UPLOAD_COMPRESSION_TYPE` | `0` | `0..3` | `0=OFF`, `1=ZSTD`, `2=LZ4`, `3=ZLIB`.<br>Controls client-side compression for outgoing payloads. |
+| `DOWNLOAD_COMPRESSION_TYPE` | `0` | `0..3` | Compression type expected or preferred for server-to-client payloads. |
+| `COMPRESSION_MIN_SIZE` | `120` | If invalid, fallback applies | Minimum payload size before compression is attempted.<br>Very small packets often grow instead of shrinking, so this avoids pointless compression work. |
 
-### MTU and Initial Testing
+### 3.4.6) 🧪 MTU Discovery and Initial Testing
 
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `MIN_UPLOAD_MTU` | `40` | Positive integer | Minimum accepted upload MTU |
-| `MIN_DOWNLOAD_MTU` | `100` | Positive integer | Minimum accepted download MTU |
-| `MAX_UPLOAD_MTU` | `150` | Positive integer | Upper upload MTU search bound |
-| `MAX_DOWNLOAD_MTU` | `500` | Positive integer | Upper download MTU search bound |
-| `MTU_TEST_RETRIES` | `2` | Positive integer | Probe retries |
-| `MTU_TEST_TIMEOUT` | `2.0` | Positive number | Probe timeout |
-| `MTU_TEST_PARALLELISM` | `24` | Positive integer | MTU test parallelism |
-| `SAVE_MTU_SERVERS_TO_FILE` | `false` | `true/false` | Saves successful MTU-tested resolvers to file |
-| `MTU_SERVERS_FILE_NAME` | `"masterdnsvpn_success_test_{time}.log"` | String | Output file name |
-| `MTU_SERVERS_FILE_FORMAT` | `"{IP} - UP: {UP_MTU} DOWN: {DOWN-MTU}"` | String | Output format for successful resolvers |
-| `MTU_USING_SECTION_SEPARATOR_TEXT` | `""` | String | Optional separator text in the output file |
-| `MTU_REMOVED_SERVER_LOG_FORMAT` | `"Resolver {IP} removed at {TIME} due to {CAUSE}"` | String | Format for removed resolver logging |
-| `MTU_ADDED_SERVER_LOG_FORMAT` | `"Resolver {IP} added back at {TIME} (UP {UP_MTU}, DOWN {DOWN_MTU})"` | String | Format for restored resolver logging |
+| `MIN_UPLOAD_MTU` | `40` | positive integer | Smallest upload MTU the client accepts during resolver testing. |
+| `MIN_DOWNLOAD_MTU` | `100` | positive integer | Smallest download MTU the client accepts during resolver testing. |
+| `MAX_UPLOAD_MTU` | `64` | positive integer | Upper bound for upload MTU testing. |
+| `MAX_DOWNLOAD_MTU` | `140` | positive integer | Upper bound for download MTU testing. |
+| `MTU_TEST_RETRIES` | `2` | if invalid, fallback applies | Number of retries for each MTU probe. |
+| `MTU_TEST_TIMEOUT` | `4.0` | if invalid, fallback applies | Timeout for a single MTU probe. |
+| `MTU_TEST_PARALLELISM` | `16` | if invalid, fallback applies | Number of resolvers tested in parallel during MTU scanning.<br>Higher values scan faster but use more CPU/network and may produce more noisy failures. |
+| `SAVE_MTU_SERVERS_TO_FILE` | `false` | `true/false` | If enabled, successful resolver results are written to an output file. |
+| `MTU_SERVERS_FILE_NAME` | `"masterdnsvpn_success_test_{time}.log"` | string | Output file name template for successful MTU-tested resolvers. |
+| `MTU_SERVERS_FILE_FORMAT` | `"{IP} - UP: {UP_MTU} DOWN: {DOWN-MTU}"` | string | Output format used in the MTU results file. |
+| `MTU_USING_SECTION_SEPARATOR_TEXT` | `""` | string | Optional separator text inserted into the MTU output file. |
+| `MTU_REMOVED_SERVER_LOG_FORMAT` | `"Resolver {IP} removed at {TIME} due to {CAUSE}"` | string | Log/output format when a resolver is removed from the valid set. |
+| `MTU_ADDED_SERVER_LOG_FORMAT` | `"Resolver {IP} added back at {TIME} (UP {UP_MTU}, DOWN {DOWN_MTU})"` | string | Log/output format when a resolver is restored. |
 
-### Runtime Workers, Queues, and Timers
+### 3.4.7) 🧵 Runtime Workers, Queues, and Timers
 
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `TUNNEL_READER_WORKERS` | `8` | Positive integer | Number of tunnel reader workers |
-| `TUNNEL_WRITER_WORKERS` | `8` | Positive integer | Number of tunnel writer workers |
-| `TUNNEL_PROCESS_WORKERS` | `6` | Positive integer | Number of tunnel processing workers |
-| `TUNNEL_PACKET_TIMEOUT_SECONDS` | `10.0` | Positive number | Overall tunnel packet timeout |
-| `DISPATCHER_IDLE_POLL_INTERVAL_SECONDS` | `0.020` | Positive number | Dispatcher idle poll interval |
-| `TX_CHANNEL_SIZE` | `8192` | Positive integer | TX channel capacity |
-| `RX_CHANNEL_SIZE` | `8192` | Positive integer | RX channel capacity |
-| `RESOLVER_UDP_CONNECTION_POOL_SIZE` | `128` | Positive integer | UDP pool size per resolver |
-| `STREAM_QUEUE_INITIAL_CAPACITY` | `256` | Positive integer | Initial stream queue capacity |
-| `ORPHAN_QUEUE_INITIAL_CAPACITY` | `64` | Positive integer | Initial orphan queue capacity |
-| `DNS_RESPONSE_FRAGMENT_STORE_CAPACITY` | `512` | Positive integer | DNS response fragment store capacity |
-| `SOCKS_UDP_ASSOCIATE_READ_TIMEOUT_SECONDS` | `30.0` | Positive number | UDP ASSOCIATE read timeout |
-| `CLIENT_TERMINAL_STREAM_RETENTION_SECONDS` | `45.0` | Positive number | Terminal stream retention time |
-| `CLIENT_CANCELLED_SETUP_RETENTION_SECONDS` | `120.0` | Positive number | Retention time for cancelled setup streams |
-| `SESSION_INIT_RETRY_BASE_SECONDS` | `1.0` | Positive number | Base retry delay for session init |
-| `SESSION_INIT_RETRY_STEP_SECONDS` | `1.0` | Positive number | Retry step increase |
-| `SESSION_INIT_RETRY_LINEAR_AFTER` | `5` | Positive integer | Switches to linear backoff after this many retries |
-| `SESSION_INIT_RETRY_MAX_SECONDS` | `60.0` | Positive number | Maximum retry delay |
-| `SESSION_INIT_BUSY_RETRY_INTERVAL_SECONDS` | `60.0` | Positive number | Retry delay for SESSION_BUSY |
+| `TUNNEL_READER_WORKERS` | `6` | if invalid, fallback applies | Number of workers reading raw UDP tunnel traffic. |
+| `TUNNEL_WRITER_WORKERS` | `6` | if invalid, fallback applies | Number of workers writing UDP tunnel traffic. |
+| `TUNNEL_PROCESS_WORKERS` | `4` | if invalid, fallback applies | Number of workers processing tunnel packets after read. |
+| `TUNNEL_PACKET_TIMEOUT_SECONDS` | `8.0` | if invalid, fallback applies | Overall timeout for tunnel packet handling. |
+| `DISPATCHER_IDLE_POLL_INTERVAL_SECONDS` | `0.020` | if invalid, fallback applies | When there is nothing to send, the dispatcher sleeps for this interval before polling again. |
+| `TX_CHANNEL_SIZE` | `4096` | if invalid, fallback applies | Capacity of the outgoing tunnel packet channel. |
+| `RX_CHANNEL_SIZE` | `4096` | if invalid, fallback applies | Capacity of the incoming tunnel packet channel. |
+| `RESOLVER_UDP_CONNECTION_POOL_SIZE` | `64` | if invalid, fallback applies | Number of reusable UDP sockets kept per resolver label. |
+| `STREAM_QUEUE_INITIAL_CAPACITY` | `128` | if invalid, fallback applies | Initial queue capacity for per-stream client transmit queues. |
+| `ORPHAN_QUEUE_INITIAL_CAPACITY` | `32` | if invalid, fallback applies | Initial capacity for the orphan control queue. |
+| `DNS_RESPONSE_FRAGMENT_STORE_CAPACITY` | `256` | if invalid, fallback applies | Capacity of the client-side DNS response fragment store. |
+| `SOCKS_UDP_ASSOCIATE_READ_TIMEOUT_SECONDS` | `30.0` | if invalid, fallback applies | Read timeout for SOCKS UDP associate mode. |
+| `CLIENT_TERMINAL_STREAM_RETENTION_SECONDS` | `45.0` | if invalid, fallback applies | How long terminal streams remain in client bookkeeping before full cleanup. |
+| `CLIENT_CANCELLED_SETUP_RETENTION_SECONDS` | `120.0` | if invalid, fallback applies | Retention time for setup streams cancelled before completion. |
+| `SESSION_INIT_RETRY_BASE_SECONDS` | `1.0` | if invalid, fallback applies | Base delay for session-init retries. |
+| `SESSION_INIT_RETRY_STEP_SECONDS` | `1.0` | if invalid, fallback applies | Step increment used in the retry schedule. |
+| `SESSION_INIT_RETRY_LINEAR_AFTER` | `5` | if invalid, fallback applies | After this many retries, the retry backoff becomes more linear. |
+| `SESSION_INIT_RETRY_MAX_SECONDS` | `60.0` | if invalid, fallback applies | Maximum retry delay for session initialization. |
+| `SESSION_INIT_BUSY_RETRY_INTERVAL_SECONDS` | `60.0` | if invalid, fallback applies | Retry delay when the server explicitly responds with `SESSION_BUSY`. |
 
-### Ping / Keepalive
+### 3.4.8) 📡 Ping / Keepalive
 
-| Parameter | Sample Value | Description |
-| :--- | :--- | :--- |
-| `PING_AGGRESSIVE_INTERVAL_SECONDS` | `0.300` | Ping interval in the hottest state |
-| `PING_LAZY_INTERVAL_SECONDS` | `1.0` | Normal ping interval |
-| `PING_COOLDOWN_INTERVAL_SECONDS` | `3.0` | Cooldown ping interval |
-| `PING_COLD_INTERVAL_SECONDS` | `30.0` | Cold ping interval |
-| `PING_WARM_THRESHOLD_SECONDS` | `5.0` | Warm threshold |
-| `PING_COOL_THRESHOLD_SECONDS` | `10.0` | Cool threshold |
-| `PING_COLD_THRESHOLD_SECONDS` | `20.0` | Cold threshold |
-
-### ARQ and Packing
-
-| Parameter | Sample Value | Description |
-| :--- | :--- | :--- |
-| `MAX_PACKETS_PER_BATCH` | `5` | Max packed control blocks in one batch |
-| `ARQ_WINDOW_SIZE` | `600` | ARQ window size |
-| `ARQ_INITIAL_RTO_SECONDS` | `0.5` | Initial data RTO |
-| `ARQ_MAX_RTO_SECONDS` | `6.0` | Maximum data RTO |
-| `ARQ_CONTROL_INITIAL_RTO_SECONDS` | `0.5` | Initial control RTO |
-| `ARQ_CONTROL_MAX_RTO_SECONDS` | `6.0` | Maximum control RTO |
-| `ARQ_MAX_CONTROL_RETRIES` | `120` | Max control retries |
-| `ARQ_INACTIVITY_TIMEOUT_SECONDS` | `1800.0` | Inactivity timeout |
-| `ARQ_DATA_PACKET_TTL_SECONDS` | `2400.0` | Data packet TTL |
-| `ARQ_CONTROL_PACKET_TTL_SECONDS` | `1200.0` | Control packet TTL |
-| `ARQ_MAX_DATA_RETRIES` | `1200` | Max data retries |
-| `ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS` | `120.0` | Terminal drain timeout |
-| `ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS` | `90.0` | Terminal ACK wait timeout |
-
-### Logging
-
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `LOG_LEVEL` | `"INFO"` | `DEBUG`, `INFO`, `WARN`, `ERROR` | Client log level |
+| `PING_AGGRESSIVE_INTERVAL_SECONDS` | `0.300` | positive number | Fastest ping interval used in the hottest activity state. |
+| `PING_LAZY_INTERVAL_SECONDS` | `1.0` | positive number | Normal operating ping interval. |
+| `PING_COOLDOWN_INTERVAL_SECONDS` | `3.0` | positive number | Ping interval during cooldown. |
+| `PING_COLD_INTERVAL_SECONDS` | `30.0` | positive number | Ping interval when the session is cold/mostly idle. |
+| `PING_WARM_THRESHOLD_SECONDS` | `5.0` | positive number | Threshold after which the session is treated as warm. |
+| `PING_COOL_THRESHOLD_SECONDS` | `10.0` | positive number | Threshold after which the session is treated as cooling down. |
+| `PING_COLD_THRESHOLD_SECONDS` | `20.0` | positive number | Threshold after which the session is treated as cold. |
+
+### 3.4.9) 🔄 ARQ and Packet Packing
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `MAX_PACKETS_PER_BATCH` | `8` | if invalid, fallback applies | Maximum number of control items the client tries to batch in one packet turn. |
+| `ARQ_WINDOW_SIZE` | `2000` | valid positive range | ARQ send/receive window size per stream. |
+| `ARQ_INITIAL_RTO_SECONDS` | `1.0` | clamped in code | Initial retransmission timeout for data packets. |
+| `ARQ_MAX_RTO_SECONDS` | `8.0` | clamped in code | Maximum retransmission timeout for data packets. |
+| `ARQ_CONTROL_INITIAL_RTO_SECONDS` | `1.0` | clamped in code | Initial retransmission timeout for control packets. |
+| `ARQ_CONTROL_MAX_RTO_SECONDS` | `8.0` | clamped in code | Maximum retransmission timeout for control packets. |
+| `ARQ_MAX_CONTROL_RETRIES` | `80` | clamped in code | Maximum number of retries for control packets. |
+| `ARQ_INACTIVITY_TIMEOUT_SECONDS` | `1800.0` | clamped in code | Stream inactivity timeout. |
+| `ARQ_DATA_PACKET_TTL_SECONDS` | `1800.0` | clamped in code | TTL for data packets before they are abandoned. |
+| `ARQ_CONTROL_PACKET_TTL_SECONDS` | `900.0` | clamped in code | TTL for control packets. |
+| `ARQ_MAX_DATA_RETRIES` | `800` | clamped in code | Maximum retries for data packets. |
+| `ARQ_DATA_NACK_MAX_GAP` | `0` | clamped in code | Maximum gap size for NACK generation when packets arrive out of order. |
+| `ARQ_DATA_NACK_REPEAT_SECONDS` | `2.0` | clamped in code | Minimum interval before repeating a NACK for the same missing sequence. |
+| `ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS` | `90.0` | clamped in code | After a stream becomes terminal, how long the client waits for queue drain. |
+| `ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS` | `60.0` | clamped in code | How long the client waits for the final terminal ACK. |
+
+### 3.4.10) 🪵 Logging
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `LOG_LEVEL` | `"INFO"` | usually `DEBUG`, `INFO`, `WARN`, `ERROR` | Controls client log verbosity.<br>`INFO` is usually enough for normal operation.<br>Use `DEBUG` when investigating resolver health, failover, ARQ, or packet paths. |
 
 ---
 
-## Section 3.5: Server Configuration Variables (`server_config.toml`) 📖
+## Section 3.5: 📖 Server Configuration (`server_config.toml`)
 
-### Tunnel Policy
+> ℹ️ Note: the sample server config contains a key named `CONFIG_VERSION`, but the current Go code does not read it into `ServerConfig`. For that reason it is not included in the table below and has no effect on real server behavior.
 
-| Parameter | Sample Value | Allowed Values | Description |
+### 3.5.1) 🌐 Tunnel Policy and Protocol Acceptance
+
+| Parameter | Sample Value in `server_config.toml.simple` | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `DOMAIN` | `["v.domain.com"]` | String list | Tunnel domains handled by the server. Must match the client. |
-| `SUPPORTED_UPLOAD_COMPRESSION_TYPES` | `[0,1,2,3]` | List from `0` to `3` | Allowed upload compression types |
-| `SUPPORTED_DOWNLOAD_COMPRESSION_TYPES` | `[0,1,2,3]` | List from `0` to `3` | Allowed download compression types |
+| `DOMAIN` | `["v.domain.com"]` | list of strings | Domain or domains that this server treats as belonging to its tunnel.<br>They must match the client `DOMAINS`, otherwise tunnel packets will not be recognized correctly. |
+| `PROTOCOL_TYPE` | `"SOCKS5"` | only `"SOCKS5"` or `"TCP"` | Determines what kind of setup the server accepts for new streams.<br>In `SOCKS5` mode, the server expects `PACKET_SOCKS5_SYN` and takes the target from the client payload.<br>In `TCP` mode, setup happens through `PACKET_STREAM_SYN` and the server connects to `FORWARD_IP:FORWARD_PORT`. |
+| `MIN_VPN_LABEL_LENGTH` | not shown in sample | if `<=0`, fallback to `3` | Minimum tunnel data label length.<br>This helps avoid confusing ordinary DNS queries with tunnel queries.<br>If this parameter is missing from your old README or config, it is worth adding because the code supports it. |
+| `SUPPORTED_UPLOAD_COMPRESSION_TYPES` | `[0, 1, 2, 3]` | valid compression IDs only | Compression modes the server allows clients to request for upload traffic. |
+| `SUPPORTED_DOWNLOAD_COMPRESSION_TYPES` | `[0, 1, 2, 3]` | valid compression IDs only | Same idea for download traffic from server to client. |
 
-### UDP Listener and Front-Door Capacity
+### 3.5.2) 📥 UDP Listener and Front-Door Capacity
 
-| Parameter | Sample Value | Description |
-| :--- | :--- | :--- |
-| `UDP_HOST` | `"0.0.0.0"` | Server bind address |
-| `UDP_PORT` | `53` | Server UDP port |
-| `UDP_READERS` | `4` | Number of UDP reader goroutines |
-| `DNS_REQUEST_WORKERS` | `24` | Number of DNS request workers |
-| `MAX_CONCURRENT_REQUESTS` | `32768` | Request queue capacity |
-| `SOCKET_BUFFER_SIZE` | `8388608` | Socket buffer size |
-| `MAX_PACKET_SIZE` | `65535` | Packet pool buffer size |
-| `DROP_LOG_INTERVAL_SECONDS` | `2.0` | Overload/drop log interval |
-
-### Deferred Session Runtime
-
-| Parameter | Sample Value | Description |
-| :--- | :--- | :--- |
-| `DEFERRED_SESSION_WORKERS` | `12` | Number of deferred session workers |
-| `DEFERRED_SESSION_QUEUE_LIMIT` | `8192` | Deferred queue capacity |
-| `SESSION_ORPHAN_QUEUE_INITIAL_CAPACITY` | `128` | Initial orphan queue capacity |
-| `STREAM_QUEUE_INITIAL_CAPACITY` | `256` | Initial stream queue capacity |
-| `DNS_FRAGMENT_STORE_CAPACITY` | `512` | DNS fragment store capacity |
-| `SOCKS5_FRAGMENT_STORE_CAPACITY` | `1024` | SOCKS5 fragment store capacity |
-
-### Session and Stream Lifecycle
-
-| Parameter | Sample Value | Description |
-| :--- | :--- | :--- |
-| `INVALID_COOKIE_WINDOW_SECONDS` | `2.0` | Invalid-cookie tracking window |
-| `INVALID_COOKIE_ERROR_THRESHOLD` | `10` | Invalid-cookie error threshold |
-| `SESSION_TIMEOUT_SECONDS` | `300.0` | Session inactivity timeout |
-| `SESSION_CLEANUP_INTERVAL_SECONDS` | `30.0` | Session cleanup interval |
-| `CLOSED_SESSION_RETENTION_SECONDS` | `600.0` | Closed-session retention time |
-| `SESSION_INIT_REUSE_TTL_SECONDS` | `600.0` | Accepted session-init reuse TTL |
-| `RECENTLY_CLOSED_STREAM_TTL_SECONDS` | `600.0` | Retention time for recently closed streams |
-| `RECENTLY_CLOSED_STREAM_CAP` | `2000` | Cap for recently closed stream records |
-| `TERMINAL_STREAM_RETENTION_SECONDS` | `45.0` | Terminal stream retention time |
-
-### DNS Tunnel Upstream
-
-| Parameter | Sample Value | Description |
-| :--- | :--- | :--- |
-| `DNS_UPSTREAM_SERVERS` | `["1.1.1.1:53", "1.0.0.1:53"]` | Upstream resolvers for DNS-over-tunnel |
-| `DNS_UPSTREAM_TIMEOUT` | `4.0` | Upstream lookup timeout |
-| `DNS_INFLIGHT_WAIT_TIMEOUT_SECONDS` | `8.0` | Inflight follower wait timeout |
-| `DNS_FRAGMENT_ASSEMBLY_TIMEOUT` | `300.0` | DNS fragment assembly timeout |
-| `DNS_CACHE_MAX_RECORDS` | `50000` | Tunnel DNS cache size |
-| `DNS_CACHE_TTL_SECONDS` | `300.0` | Tunnel DNS cache TTL |
-
-### Forwarding and External SOCKS
-
-| Parameter | Sample Value | Description |
-| :--- | :--- | :--- |
-| `SOCKS_CONNECT_TIMEOUT` | `8.0` | Outbound connect timeout |
-| `USE_EXTERNAL_SOCKS5` | `false` | Whether to chain through an external SOCKS5 |
-| `SOCKS5_AUTH` | `false` | Auth for external SOCKS5 |
-| `SOCKS5_USER` | `"admin"` | External SOCKS5 username |
-| `SOCKS5_PASS` | `"123456"` | External SOCKS5 password |
-| `FORWARD_IP` | `""` | External SOCKS5 IP |
-| `FORWARD_PORT` | `0` | External SOCKS5 port |
-
-### Security
-
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `DATA_ENCRYPTION_METHOD` | `1` | `0` to `5` | Must match the client |
-| `ENCRYPTION_KEY_FILE` | `"encrypt_key.txt"` | File path | Path to the server key file |
+| `UDP_HOST` | `"0.0.0.0"` | if empty, this value is used | Address where the DNS server binds.<br>`0.0.0.0` means listen on all interfaces. |
+| `UDP_PORT` | `53` | `1..65535` | UDP port used by the server.<br>In most deployments this should remain `53` so resolvers can query it directly. |
+| `UDP_READERS` | `2` | auto-default if `<=0` | Number of goroutines reading directly from the UDP socket.<br>A larger number may help on very busy servers, but beyond a point it only increases context switching. |
+| `DNS_REQUEST_WORKERS` | `4` | auto-default if `<=0` | Number of workers that take requests from the front-door queue and pass them into the session/decode layer. |
+| `MAX_CONCURRENT_REQUESTS` | `4096` | fallback if `<=0` | Capacity of the incoming request queue.<br>If this queue fills up, packets are dropped and the server emits rate-limited overload logs. |
+| `SOCKET_BUFFER_SIZE` | `4194304` | fallback if `<=0` | Operating-system socket buffer size request for the UDP listener.<br>This matters for heavy bursts of incoming traffic. |
+| `MAX_PACKET_SIZE` | `65535` | fallback if `<=0` | Size of the largest packet buffer that the packet pool allocates. |
+| `DROP_LOG_INTERVAL_SECONDS` | `2.0` | fallback if `<=0` | Minimum interval between repeated overload/drop logs, to avoid log spam during pressure. |
 
-### ARQ, Packing, and Control TTLs
+### 3.5.3) 🧠 Deferred Session Runtime
 
-| Parameter | Sample Value | Description |
-| :--- | :--- | :--- |
-| `MAX_PACKETS_PER_BATCH` | `20` | Max packed control packets per response |
-| `PACKET_BLOCK_CONTROL_DUPLICATION` | `2` | Repeats the last packed control block for extra turns |
-| `STREAM_SETUP_ACK_TTL_SECONDS` | `400.0` | Setup ACK TTL |
-| `STREAM_RESULT_PACKET_TTL_SECONDS` | `300.0` | Result packet TTL |
-| `STREAM_FAILURE_PACKET_TTL_SECONDS` | `120.0` | Failure packet TTL |
-| `ARQ_WINDOW_SIZE` | `600` | ARQ window size |
-| `ARQ_INITIAL_RTO_SECONDS` | `0.5` | Initial data RTO |
-| `ARQ_MAX_RTO_SECONDS` | `6.0` | Maximum data RTO |
-| `ARQ_CONTROL_INITIAL_RTO_SECONDS` | `0.5` | Initial control RTO |
-| `ARQ_CONTROL_MAX_RTO_SECONDS` | `6.0` | Maximum control RTO |
-| `ARQ_MAX_CONTROL_RETRIES` | `120` | Max control retries |
-| `ARQ_INACTIVITY_TIMEOUT_SECONDS` | `1800.0` | Inactivity timeout |
-| `ARQ_DATA_PACKET_TTL_SECONDS` | `2400.0` | Data packet TTL |
-| `ARQ_CONTROL_PACKET_TTL_SECONDS` | `1200.0` | Control packet TTL |
-| `ARQ_MAX_DATA_RETRIES` | `1200` | Max data retries |
-| `ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS` | `120.0` | Terminal drain timeout |
-| `ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS` | `90.0` | Terminal ACK wait timeout |
-
-### Logging
-
-| Parameter | Sample Value | Allowed Values | Description |
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `LOG_LEVEL` | `"INFO"` | `DEBUG`, `INFO`, `WARN`, `ERROR` | Server log level |
+| `DEFERRED_SESSION_WORKERS` | `2` | clamped up to `128` | Number of deferred-session workers.<br>These workers handle ordering-sensitive and setup-heavy tasks such as stream setup, SOCKS connect, and some DNS assembly tasks.<br>Too few can slow down stream setup; too many can create unnecessary contention. |
+| `DEFERRED_SESSION_QUEUE_LIMIT` | `2048` | clamped to `256..14336` | Queue capacity for deferred-session work.<br>If it fills up, new setup or deferred tasks may be rejected. |
+| `SESSION_ORPHAN_QUEUE_INITIAL_CAPACITY` | `128` | clamped to `4..4096` | Initial capacity of the per-session orphan control queue. |
+| `STREAM_QUEUE_INITIAL_CAPACITY` | `256` | clamped to `8..65536` | Initial capacity of each stream queue on the server. |
+| `DNS_FRAGMENT_STORE_CAPACITY` | `512` | clamped to `16..16384` | Capacity used to hold DNS tunnel fragments while waiting for full assembly. |
+| `SOCKS5_FRAGMENT_STORE_CAPACITY` | `1024` | clamped to `16..16384` | Capacity used to hold fragmented SOCKS5 setup payloads. |
+
+### 3.5.4) 🍪 Session / Stream Lifecycle and Invalid Cookie Tracking
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `INVALID_COOKIE_WINDOW_SECONDS` | `2.0` | fallback if `<=0` | Time window used to count invalid-cookie errors.<br>This helps the server detect broken sessions or clients repeatedly using a wrong cookie. |
+| `INVALID_COOKIE_ERROR_THRESHOLD` | `10` | fallback if `<=0` | If invalid-cookie errors reach this threshold inside the window above, the server responds more aggressively. |
+| `SESSION_TIMEOUT_SECONDS` | `300.0` | fallback if `<=0` | If a session has no activity for this long, the server times it out and cleans it up. |
+| `SESSION_CLEANUP_INTERVAL_SECONDS` | `30.0` | fallback if `<=0` | How often the periodic session cleanup loop runs. |
+| `CLOSED_SESSION_RETENTION_SECONDS` | `600.0` | fallback if `<=0` | How long closed-session metadata is kept so late packets can still be recognized. |
+| `SESSION_INIT_REUSE_TTL_SECONDS` | `600.0` | clamp to `1..86400` seconds | How long session-init signatures are kept for reuse and simple replay protection. |
+| `RECENTLY_CLOSED_STREAM_TTL_SECONDS` | `600.0` | clamp to `1..86400` seconds | How long recently closed streams remain in the “recently closed” table so late SYN packets do not revive them. |
+| `RECENTLY_CLOSED_STREAM_CAP` | `2000` | clamp to `1..1000000` | Maximum number of recently closed stream entries the server keeps. |
+| `TERMINAL_STREAM_RETENTION_SECONDS` | `45.0` | clamp to `1..86400` seconds | How long terminal streams remain before final sweeping. |
+
+### 3.5.5) 📛 DNS Tunnel Upstream
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `DNS_UPSTREAM_SERVERS` | `["1.1.1.1:53", "1.0.0.1:53"]` | fallback if empty | When the client sends a real DNS request through the tunnel, the server forwards it to these upstream resolvers.<br>This section is only for DNS-over-tunnel, not for the tunnel transport itself. |
+| `DNS_UPSTREAM_TIMEOUT` | `4.0` | fallback if `<=0` | Timeout for each exchange with the real DNS upstream. |
+| `DNS_INFLIGHT_WAIT_TIMEOUT_SECONDS` | `60.0` | clamp to `0.1..120` seconds | If several identical DNS queries arrive at the same time, only one upstream lookup is performed and the rest wait as followers.<br>This value controls how long followers wait for the main lookup result. |
+| `DNS_FRAGMENT_ASSEMBLY_TIMEOUT` | `300.0` | fallback if `<=0` | How long the server waits for all fragments of a tunneled DNS query to arrive. |
+| `DNS_CACHE_MAX_RECORDS` | `50000` | fallback if `<1` | Maximum size of the server’s internal DNS cache for tunneled DNS queries. |
+| `DNS_CACHE_TTL_SECONDS` | `300.0` | fallback if `<=0` | TTL of the server-side internal DNS cache. |
+
+### 3.5.6) 🌐 Forwarding and External SOCKS
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `SOCKS_CONNECT_TIMEOUT` | `120.0` | fallback if `<=0` | Timeout for the server’s outbound connection to the final target or to an external SOCKS5 server.<br>The sample shows a higher value, but the real code fallback is `8` seconds. |
+| `USE_EXTERNAL_SOCKS5` | `false` | `true/false` | If `true`, the server sends outbound traffic through an external SOCKS5 server instead of connecting directly.<br>This is mainly useful for chaining or hiding server egress. |
+| `SOCKS5_AUTH` | `false` | `true/false` | Whether the external SOCKS5 server requires username/password authentication. |
+| `SOCKS5_USER` | `"admin"` | up to 255 bytes | Username for the external SOCKS5 server. |
+| `SOCKS5_PASS` | `"123456"` | up to 255 bytes | Password for the external SOCKS5 server.<br>If auth is enabled and username/password are invalid, the config becomes invalid. |
+| `FORWARD_IP` | `""` | string | In `TCP` mode, this is the fixed outbound target.<br>In `SOCKS5` mode with `USE_EXTERNAL_SOCKS5=true`, this is the address of the upstream SOCKS5 server itself. |
+| `FORWARD_PORT` | `0` | `0..65535` | Port of the endpoint above.<br>If `USE_EXTERNAL_SOCKS5=true`, this must be a valid non-zero value. |
+
+### 3.5.7) 🔐 Security
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `DATA_ENCRYPTION_METHOD` | `1` | `0..5` | Must match the client.<br>If an invalid value is supplied, the current code normalizes it back to `1`. |
+| `ENCRYPTION_KEY_FILE` | `"encrypt_key.txt"` | relative or absolute path | Path to the server encryption key file.<br>If it is relative, it is resolved relative to the config directory.<br>If it is empty, the fallback is `encrypt_key.txt`. |
+
+### 3.5.8) 🔄 ARQ, Packing, and Control TTLs
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `MAX_PACKETS_PER_BATCH` | `10` | fallback if `<1` | Maximum number of control blocks the server tries to pack into one response.<br>Important note: if the value is invalid, the real code fallback is `20`. |
+| `PACKET_BLOCK_CONTROL_DUPLICATION` | `1` | clamp to `1..16` | How many extra turns the last packed control block should be repeated.<br>`1` effectively means duplication is off.<br>This is useful on lossy links so critical ACK/close data arrives more reliably. |
+| `STREAM_SETUP_ACK_TTL_SECONDS` | `400.0` | clamp to `1..86400` seconds | TTL of ACK packets related to stream setup. |
+| `STREAM_RESULT_PACKET_TTL_SECONDS` | `300.0` | clamp to `1..86400` seconds | TTL of result packets such as connect success/failure that must reach the client. |
+| `STREAM_FAILURE_PACKET_TTL_SECONDS` | `120.0` | clamp to `1..86400` seconds | TTL of failure packets for setup or outbound errors. |
+| `ARQ_WINDOW_SIZE` | `600` | clamp to `1..16384` | ARQ window size per stream on the server. |
+| `ARQ_INITIAL_RTO_SECONDS` | `1` | clamp to `0.05..60` seconds | Initial retransmission timeout for data packets. |
+| `ARQ_MAX_RTO_SECONDS` | `5.0` | clamp to `[ARQ_INITIAL_RTO_SECONDS, 120]` | Maximum retransmission timeout for data packets. |
+| `ARQ_CONTROL_INITIAL_RTO_SECONDS` | `0.5` | clamp to `0.05..60` seconds | Initial retransmission timeout for control packets. |
+| `ARQ_CONTROL_MAX_RTO_SECONDS` | `3.0` | clamp to `[ARQ_CONTROL_INITIAL_RTO_SECONDS, 120]` | Maximum retransmission timeout for control packets. |
+| `ARQ_MAX_CONTROL_RETRIES` | `300` | clamp to `5..5000` | Maximum retries for control packets. |
+| `ARQ_INACTIVITY_TIMEOUT_SECONDS` | `1800.0` | clamp to `30..86400` seconds | Inactivity timeout for streams. |
+| `ARQ_DATA_PACKET_TTL_SECONDS` | `2400.0` | clamp to `30..86400` seconds | TTL for data packets. |
+| `ARQ_CONTROL_PACKET_TTL_SECONDS` | `1200.0` | clamp to `30..86400` seconds | TTL for control packets. |
+| `ARQ_MAX_DATA_RETRIES` | `1200` | clamp to `60..100000` | Maximum retries for data packets. |
+| `ARQ_DATA_NACK_MAX_GAP` | not shown in sample | clamp to `0..32` | If out-of-order packets arrive, this controls how large a missing gap may be reported with NACK.<br>This exists in code and was missing in older README versions. |
+| `ARQ_DATA_NACK_REPEAT_SECONDS` | not shown in sample | clamp to `0.1..30` seconds | For a missing sequence, this defines how soon a repeated NACK may be issued again.<br>This is active in code and should be documented. |
+| `ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS` | `120.0` | clamp to `10..3600` seconds | After a stream becomes terminal, how long the server waits for queues to drain. |
+| `ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS` | `90.0` | clamp to `5..3600` seconds | After terminal close, how long the server waits for the final ACK. |
+
+### 3.5.9) 🪵 Logging
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `LOG_LEVEL` | `"INFO"` | usually `DEBUG`, `INFO`, `WARN`, `ERROR` | Server log level.<br>For normal production usage, `INFO` is usually enough.<br>For deep investigation of sessions, deferred workers, or ARQ behavior, temporarily use `DEBUG`. |
 
 ---
 
-## Section 3.6: Better MTU Understanding and Practical Tuning ⚡
+## Section 3.6: 🧪 Testing, Finding, and Scanning Resolvers
 
-The current Go version still depends heavily on a good MTU range. If you set MTU too high:
+Finding suitable resolvers is one of the most important parts of any DNS tunnel project. In this project, the client can automatically find healthy resolvers and test their MTU.
+You can use this client feature to discover healthy resolvers, test your own resolvers, or scan resolver ranges.
+Just place all IPs line by line into `client_resolvers.txt`.
 
-- more resolvers will fail
-- startup takes longer
+Then back up your current `client_config.toml`, open it with a text editor, and replace the following values with these suggested ones:
+
+- Lower the MTU ceiling so you find all servers that really behave as DNS servers, and make Min and Max equal to speed up scanning by avoiding automatic binary-search style probing.
+
+```toml
+MIN_UPLOAD_MTU=30
+MIN_DOWNLOAD_MTU=40
+MAX_UPLOAD_MTU=30
+MAX_DOWNLOAD_MTU=40
+```
+
+- Increase the number of parallel resolver checks:
+
+```toml
+MTU_TEST_PARALLELISM = 200
+```
+
+- Save healthy resolver results into a text file for later review:
+
+```toml
+SAVE_MTU_SERVERS_TO_FILE = true
+```
+
+- Change the output format so only the IP is written, which is easier to reuse:
+
+```toml
+MTU_SERVERS_FILE_FORMAT = "{IP}"
+```
+
+- Reduce retries and timeout to speed up the scan. With these settings you may miss some slightly slower but still healthy resolvers, so increase them if you want more accurate results.
+
+```toml
+MTU_TEST_RETRIES = 1
+MTU_TEST_TIMEOUT = 1.0
+```
+
+> ⚠️ **Important note:** You must already have a server running and must place its key and domain into `client_config.toml` before doing this. Otherwise the client cannot perform MTU tests correctly and will likely mark all resolvers invalid.
+
+Now run the program and wait for the tests to finish. After the process completes, close the program. You will find the saved resolver list in a new `.txt` file next to the main file, and you can then use it as your new `client_resolvers.txt`.
+
+After that, return to your previous settings and use the healthy resolvers you discovered for the best performance.
+
+---
+
+## Section 3.7: ⚡ Better MTU Understanding and Practical Fast Tuning
+
+This project depends heavily on a suitable MTU. If you set the MTU too high:
+
+- more resolvers fail
+- startup becomes longer
 - fragmentation and loss increase
 
 If you set it too low:
 
-- speed drops
-- but stability usually improves
+- speed decreases
+- but stability improves
 
 ### Practical suggestion
 
-1. Start from the sample config
-2. Let the client test the resolvers
-3. Review the MTU results and valid resolver count
-4. If quality is poor, lower `MIN_UPLOAD_MTU` and `MIN_DOWNLOAD_MTU`
-5. If startup is too slow, narrow the `MIN/MAX` MTU range
+1. Start with the sample config.
+2. Let the client test resolvers.
+3. Review the MTU results and the number of valid resolvers.
+4. If quality is poor, lower `MIN_UPLOAD_MTU` and `MIN_DOWNLOAD_MTU` slightly.
+5. If you want faster startup, narrow the `MIN/MAX` MTU range and bring them closer together.
 
 ---
 
 ## Section 4: Mobile Usage Guide (Android and iPhone) 📱
 
-There is currently no direct Android or iOS app, but you can still use the tunnel on mobile through one of these methods:
+Since there is currently no direct Android or iOS application, you can still use the tunnel on mobile with one of these methods:
 
 ### Method 1: Share the proxy from your computer 📶
 
@@ -597,70 +770,57 @@ There is currently no direct Android or iOS app, but you can still use the tunne
 
 ### Method 2: Run the client on an intermediate server 🏗️
 
-1. Run the main server on the final destination side
+1. Run the main server on the final destination
 2. Run the client on an intermediate server
 3. Set `LISTEN_IP` to `0.0.0.0`
-4. Point your phone to the SOCKS5 proxy on that server
+4. Connect the phone to the SOCKS5 proxy on that intermediate server
 
-### Method 3: Combine it with another panel or transport 🛠️
+### Method 3: Combine it with other panels or services 🛠️
 
-If you already use another panel or proxy system, you can point its outbound path to the local SOCKS5 port of the MasterDnsVPN client.
+If you already have another panel or service on a server, you can point its outbound path to the local SOCKS5 of the MasterDnsVPN client and use it as the exit path.
 
-### ⚠️ Important security notes for mobile use
+### ⚠️ Important Security Notes for Mobile
 
-- If `LISTEN_IP = "0.0.0.0"`, always enable SOCKS5 authentication
-- If devices cannot connect, check the local firewall
+- If `LISTEN_IP = "0.0.0.0"`, enable SOCKS5 authentication or make sure your network is trusted. Otherwise anyone on that network can use your tunnel. Using username/password on Internet-facing SOCKS5 is strongly recommended.
+- You can also change the default `LISTEN_PORT` so it is less exposed to automated scans.
+- If devices cannot connect, check the system firewall.
 
 ---
 
-## Section 5: Emergency Tips and Troubleshooting 🚨
+### Section 5.2: Fixing Port 53 Already in Use (Linux Server) 🛑
 
-### Section 5.1: Recommended settings for very lossy networks ⚠️
-
-If your network is highly unstable:
-
-1. Increase the number of resolvers
-2. Raise `PACKET_DUPLICATION_COUNT`
-3. Try balancing strategies `3` or `4`
-4. Lower MTU
-5. Keep the resolver health system enabled
-
-On very harsh networks, duplication values between `3` and `6` are often reasonable, at the cost of extra bandwidth and CPU.
-
-### Section 5.2: Fixing port 53 conflicts on Linux 🛑
-
-On many Linux distributions, `systemd-resolved` already occupies port `53`. If the server cannot bind to the port:
+On most Linux distributions, port `53` is already occupied by `systemd-resolved`. If the server does not start:
 
 ```bash
 sudo nano /etc/systemd/resolved.conf
 ```
 
-Set:
+Set this value:
 
 ```text
 DNSStubListener=no
 ```
 
-Then restart:
+Then:
 
 ```bash
 sudo systemctl restart systemd-resolved
 ```
 
-> ⚠️ **Important warning:** You cannot run multiple DNS tunnel projects at the same time on port `53` on the same server.
+> ⚠️ **Important warning:** You cannot run multiple DNS tunnel projects at the same time on the same server on port `53`.
 
 ---
 
-## Section 6: System Architecture and How It Works 🛠️
+## Section 6: 🛠️ System Architecture and How It Works
 
-**MasterDnsVPN** combines session multiplexing, resolver balancing, packet duplication, a custom ARQ layer, and a deferred session runtime on top of UDP/DNS to avoid the usual weaknesses of typical tunnels.
+**MasterDnsVPN** combines Session Multiplexing, Resolver Balancing, Packet Duplication, a custom ARQ layer, and a Deferred Session Runtime on top of UDP/DNS to avoid the usual limitations of ordinary tunnels.
 
-### Section 6.1: High-Level Architecture Diagram 🌐
+### Section 6.1: 🌐 High-Level Architecture Diagram
 
 ```mermaid
 graph TD
-    subgraph Client_Side ["🖥️ User Device (Client - Go)"]
-        App["📱 User Applications (Browser, Telegram, etc.)"]
+    subgraph Client_Side ["🖥️ User Device (Client)"]
+        App["📱 Applications (Browser, Telegram, etc.)"]
         Proxy["🧦 Local SOCKS5 / TCP Proxy"]
         LDNS["📛 Local DNS (Optional)"]
         ResolverRuntime["⚡ Balancer + Duplication + Resolver Health"]
@@ -673,7 +833,7 @@ graph TD
         RN["📡 Resolver N"]
     end
 
-    subgraph Server_Side ["🖥️ Remote Server (Server - Go)"]
+    subgraph Server_Side ["🖥️ Remote Server"]
         UDP["📥 UDP Listener + Request Workers"]
         Sessions["🧠 Session Store + Deferred Workers"]
         ServerARQ["🔄 Server ARQ + Packed Control Blocks"]
@@ -699,57 +859,56 @@ graph TD
     DNSUp --> UDP
 ```
 
-### Section 6.2: Packet Lifecycle and Flow 🔄
+### Section 6.2: 🔄 Packet Lifecycle and Flow
 
 ```mermaid
 sequenceDiagram
     participant App as 📱 User App
-    participant Client as 🖥️ Go Client
+    participant Client as 🖥️ Client
     participant DNS as 📡 Resolvers
-    participant Server as 🖥️ Go Server
+    participant Server as 🖥️ Server
     participant Target as 🌐 Final Target
 
-    App->>Client: Open SOCKS5 / TCP connection
+    App->>Client: Create SOCKS5 / TCP connection
     Note over Client: Build Session/Stream<br/>Encrypt, ARQ, choose resolver
     Client->>DNS: Send DNS query with duplication and balancing
-    DNS->>Server: Deliver query to NS server
+    DNS->>Server: Deliver query to the server NS
     Note over Server: Checksum / Cookie / Session lookup<br/>Deferred setup / ARQ / Queueing
     Server->>Target: Direct dial or external SOCKS5
-    Target-->>Server: Return data
-    Note over Server: Put data into ARQ<br/>Generate ACKs and packed control blocks
-    Server-->>DNS: Send DNS response
-    DNS-->>Client: Deliver DNS response
-    Note over Client: ARQ reorder / ACK consume / Deliver to app
-    Client-->>App: Clean ordered data
+    Target-->>Server: Return target response
+    Note over Server: Put data into ARQ<br/>Build ACKs and packed control blocks
+    Server-->>DNS: DNS response
+    DNS-->>Client: DNS reply
+    Note over Client: ARQ reorder / ACK consume / deliver to app
+    Client-->>App: Ordered clean data
 ```
 
-### Section 6.3: Core Concepts 🧠
+### Section 6.3: 🧠 Core Concepts Used by the System
 
 | Concept | Description |
 | :--- | :--- |
 | **Session** | One overall connection between client and server |
-| **Stream** | One logical independent channel carried inside a session |
+| **Stream** | One independent logical connection carried inside a session |
 | **Resolver Runtime** | Resolver selection, duplication, health tracking, auto-disable, and recheck |
 | **ARQ** | Ordering, ACK, retransmission, timeout, and terminal handling |
 | **Deferred Session Runtime** | Ordering-sensitive tasks such as setup, DNS query handling, and sensitive packet flows |
-| **Packed Control Blocks** | Multiple small ACK/control packets packed together |
-| **Synced MTU** | The shared MTU chosen across the valid resolver pool |
+| **Packed Control Blocks** | Multiple small ACK or control packets packed into one block |
+| **Synced MTU** | The shared MTU chosen across the healthy resolver pool |
 
 ---
 
-## Section 7: Advanced Technical Notes ⚙️
+## Section 7: ⚙️ Advanced Technical Notes
 
-- ⚡ **Direct connect or external SOCKS5:** If `USE_EXTERNAL_SOCKS5 = false`, the server dials targets directly. If `true`, it chains through an external SOCKS5 proxy.
-- 🔄 **Adaptive ping and polling:** The client keeps idle load lower using its ping profile and dispatcher polling controls.
-- 🧠 **Per-stream resolver failover:** If a stream gets stuck on a weak resolver, its preferred resolver can be switched.
-- 📦 **Repeated packed control blocks:** The server can repeat the last packed control block for additional dispatcher turns to improve reliability on lossy links.
+- ⚡ **Direct connect or external SOCKS5:** If `USE_EXTERNAL_SOCKS5 = false`, the server connects directly to the target. If `true`, it chains through an external SOCKS5 proxy. In general usage you usually do not need an external SOCKS5 server, so this can stay disabled.
+- 🧠 **Per-stream resolver failover:** If a stream gets stuck on a weak resolver, its preferred resolver can move to another one.
+- 📦 **Repeated packed control blocks:** The server can repeat the last packed control block for extra turns so important ACK/close packets have a better chance to survive on lossy links.
 - 🔒 **Server-side key generation:** If `encrypt_key.txt` does not exist, the server creates it during startup.
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions. If you have an idea, bug fix, or performance improvement, please open an issue or a pull request.
+We welcome all contributions. If you have an idea, bug report, or performance improvement, please open an Issue or Pull Request.
 
 [Issues](https://github.com/masterking32/MasterDnsVPN/issues)
 
@@ -759,7 +918,7 @@ We welcome contributions. If you have an idea, bug fix, or performance improveme
 
 ## 📄 License
 
-This project is released under the **MIT** license. See the `LICENSE` file for details.
+This project is published under the **MIT** license. For more details, see the `LICENSE` file.
 
 ---
 

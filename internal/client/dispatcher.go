@@ -57,6 +57,32 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 		return true
 	}
 
+	waitForTxCapacity := func(required int) bool {
+		if required <= 0 {
+			return true
+		}
+		for {
+			if c.txChannelHasCapacity(required) {
+				return true
+			}
+
+			select {
+			case <-ctx.Done():
+				return false
+			case <-c.txSpaceSignal:
+			case <-idleTimer.C:
+			}
+
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(idlePoll)
+		}
+	}
+
 dispatchLoop:
 	for {
 		currentVersion := c.streamSetVersion.Load()
@@ -196,8 +222,8 @@ dispatchLoop:
 			continue dispatchLoop
 		}
 
-		if !c.txChannelHasCapacity(len(conns)) {
-			if !waitForWork() {
+		if !waitForTxCapacity(len(conns)) {
+			if ctx.Err() != nil {
 				return
 			}
 			continue dispatchLoop
@@ -329,6 +355,7 @@ dispatchLoop:
 				finalPacket.packetType = Enums.PACKET_PACKED_CONTROL_BLOCKS
 				finalPacket.payload = payload
 				wasPacked = true
+
 				if selected != nil {
 					selected.ReleaseTXPacket(item)
 				}
@@ -394,19 +421,15 @@ dispatchLoop:
 			pkt := finalPacket
 			pkt.conn = conn
 			pkt.payload = dnsPacket
+			pkt.sequenceNum = item.SequenceNum
 
 			select {
 			case c.txChannel <- pkt:
-				// if !isLogged && pkt.packetType != Enums.PACKET_PING {
-				// 	packedSummary := ""
-				// 	if opts.PacketType == Enums.PACKET_PACKED_CONTROL_BLOCKS {
-				// 		packedSummary = " | " + VpnProto.DescribePackedControlBlocks(opts.Payload, 4)
-				// 	}
-				// 	c.logOutboundPacket(opts.PacketType, opts.SessionID, len(opts.Payload), opts.StreamID, opts.SequenceNum, opts.FragmentID, opts.TotalFragments, packedSummary)
-				// }
-				// isLogged = true
-			default:
-				c.log.Warnf("TX channel filled before enqueue completed | Packet: %s | Stream: %d", Enums.PacketTypeName(finalPacket.packetType), selectedStreamID)
+			case <-ctx.Done():
+				if !wasPacked && selected != nil {
+					selected.ReleaseTXPacket(item)
+				}
+				return
 			}
 		}
 

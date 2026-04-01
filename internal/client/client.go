@@ -43,12 +43,12 @@ type Client struct {
 	successMTUChecks    bool
 	udpBufferPool       sync.Pool
 	resolverConnsMu     sync.Mutex
-	resolverConns       map[string]chan *net.UDPConn
+	resolverConns       map[string]chan pooledUDPConn
 	resolverAddrMu      sync.RWMutex
 	resolverAddrCache   map[string]*net.UDPAddr
-	resolverStatsMu     sync.Mutex
+	resolverStatsMu     sync.RWMutex
 	resolverPending     map[resolverSampleKey]resolverSample
-	resolverHealthMu    sync.Mutex
+	resolverHealthMu    sync.RWMutex
 	resolverHealth      map[string]*resolverHealthState
 	resolverRecheck     map[string]resolverRecheckState
 	runtimeDisabled     map[string]resolverDisabledState
@@ -136,6 +136,9 @@ type Client struct {
 	localDNSCacheFlushTick time.Duration
 	localDNSCacheLoadOnce  sync.Once
 	localDNSCacheFlushOnce sync.Once
+
+	// SOCKS5 brute-force rate limiter
+	socksRateLimit *socksRateLimiter
 }
 
 // clientStreamTXPacket represents a queued packet pending transmission or retransmission.
@@ -220,7 +223,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 				return make([]byte, RuntimeUDPReadBufferSize)
 			},
 		},
-		resolverConns:                         make(map[string]chan *net.UDPConn),
+		resolverConns:                         make(map[string]chan pooledUDPConn),
 		resolverAddrCache:                     make(map[string]*net.UDPAddr),
 		resolverPending:                       make(map[resolverSampleKey]resolverSample),
 		resolverHealth:                        make(map[string]*resolverHealthState),
@@ -261,6 +264,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		localDNSCacheFlushTick: time.Duration(cfg.LocalDNSCacheFlushSec) * time.Second,
 		orphanQueue:            mlq.New[VpnProto.Packet](cfg.OrphanQueueInitialCapacity),
 		sessionResetSignal:     make(chan struct{}, 1),
+		socksRateLimit:         newSocksRateLimiter(),
 	}
 
 	if c.streamResolverFailoverResendThreshold < 1 {
@@ -410,9 +414,9 @@ func (c *Client) HandleStreamPacket(packet VpnProto.Packet) error {
 		return nil
 	}
 
-	c.streamsMu.Lock()
+	c.streamsMu.RLock()
 	s, ok := c.active_streams[packet.StreamID]
-	c.streamsMu.Unlock()
+	c.streamsMu.RUnlock()
 
 	if !ok || s == nil {
 		return nil
