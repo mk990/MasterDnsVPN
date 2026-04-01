@@ -141,6 +141,16 @@ func (c *Client) signalTxSpace() {
 	}
 }
 
+func (c *Client) encodeChannelHasCapacity(needed int) bool {
+	if c == nil || c.encodeChannel == nil {
+		return false
+	}
+	if needed <= 0 {
+		needed = 1
+	}
+	return cap(c.encodeChannel)-len(c.encodeChannel) >= needed
+}
+
 func (c *Client) txChannelHasCapacity(needed int) bool {
 	if c == nil || c.txChannel == nil {
 		return false
@@ -308,7 +318,13 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 		go c.asyncWriterWorker(runtimeCtx, i, conn)
 	}
 
-	// 7. Spawn Dispatcher (Fair Queuing & Packing)
+	// 7. Spawn Encoder Workers
+	for i := 0; i < c.tunnelProcessWorkers; i++ {
+		c.asyncWG.Add(1)
+		go c.asyncEncoderWorker(runtimeCtx, i)
+	}
+
+	// 8. Spawn Dispatcher (Fair Queuing & Packing)
 	c.asyncWG.Add(1)
 	go c.asyncStreamDispatcher(runtimeCtx)
 
@@ -589,4 +605,75 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr) {
 		c.log.Warnf("\U0001F6A8 <red>Handler execution failed: %v</red>", err)
 	}
 
+}
+
+// asyncEncoderWorker pulls from encodeChannel, performs the heavy DNS building and crypto, and pushes to txChannel.
+func (c *Client) asyncEncoderWorker(ctx context.Context, id int) {
+	defer c.asyncWG.Done()
+	c.log.Debugf("\U0001F5A5 <green>Encoder Worker <cyan>#%d</cyan> started</green>", id)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-c.encodeChannel:
+			c.signalTxSpace()
+			if !ok {
+				return
+			}
+
+			conns := task.conns
+			if len(conns) == 0 {
+				if !task.wasPacked && task.selected != nil {
+					task.selected.ReleaseTXPacket(task.item)
+				}
+				continue
+			}
+
+			encoded, err := c.buildEncodedAutoWithCompressionTrace(task.opts)
+			if err != nil {
+				if !task.wasPacked && task.selected != nil {
+					task.selected.ReleaseTXPacket(task.item)
+				}
+				continue
+			}
+
+			packetByDomain := make(map[string][]byte, len(conns))
+			for _, conn := range conns {
+				domain := conn.Domain
+				if domain == "" {
+					domain = c.cfg.Domains[0]
+				}
+
+				dnsPacket, ok := packetByDomain[domain]
+				if !ok {
+					dnsPacket, err = buildTunnelTXTQuestion(domain, encoded)
+					if err != nil {
+						continue
+					}
+					packetByDomain[domain] = dnsPacket
+				}
+
+				pkt := asyncPacket{
+					packetType:  task.packetType,
+					streamID:    task.opts.StreamID,
+					payload:     dnsPacket,
+					conn:        conn,
+					sequenceNum: task.opts.SequenceNum,
+				}
+
+				select {
+				case c.txChannel <- pkt:
+				case <-ctx.Done():
+					if !task.wasPacked && task.selected != nil {
+						task.selected.ReleaseTXPacket(task.item)
+					}
+					return
+				}
+			}
+
+			if !task.wasPacked && task.selected != nil {
+				task.selected.ReleaseTXPacket(task.item)
+			}
+		}
+	}
 }

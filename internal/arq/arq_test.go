@@ -574,6 +574,8 @@ func TestARQ_ReceiveDataSendsBoundedNackForNearGap(t *testing.T) {
 		DataNackMaxGap:        2,
 		DataNackRepeatSeconds: 2.0,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(1, []byte("packet 1"))
 
@@ -599,6 +601,8 @@ func TestARQ_ReceiveDataDoesNotNackFarGap(t *testing.T) {
 		DataNackMaxGap:        2,
 		DataNackRepeatSeconds: 2.0,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(3, []byte("packet 3"))
 
@@ -721,6 +725,8 @@ func TestARQ_ReceiveDataSuppressesRepeatedNackUntilInterval(t *testing.T) {
 		DataNackMaxGap:        2,
 		DataNackRepeatSeconds: 2.0,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(1, []byte("packet 1"))
 	<-enqueuer.Packets
@@ -749,6 +755,8 @@ func TestARQ_ReceiveDataWaitsForInitialNackDelay(t *testing.T) {
 		DataNackInitialDelaySeconds: 0.2,
 		DataNackRepeatSeconds:       1.0,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(1, []byte("packet 1"))
 
@@ -787,6 +795,8 @@ func TestARQ_ReceiveDataClearsPendingInitialNackDelayWhenGapArrives(t *testing.T
 		DataNackInitialDelaySeconds: 0.2,
 		DataNackRepeatSeconds:       1.0,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(2, []byte("packet 2"))
 	if p := <-enqueuer.Packets; p.packetType != Enums.PACKET_STREAM_DATA_ACK {
@@ -820,6 +830,8 @@ func TestARQ_ReceiveDataDoesNotNackAlreadyBufferedGap(t *testing.T) {
 		DataNackMaxGap:        4,
 		DataNackRepeatSeconds: 0.1,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(2, []byte("packet 2"))
 	<-enqueuer.Packets
@@ -864,6 +876,8 @@ func TestARQ_ReceiveDataNacksRecentWindowWhenRcvNxtStalls(t *testing.T) {
 		DataNackMaxGap:        4,
 		DataNackRepeatSeconds: 0.1,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(10, []byte("packet 10"))
 	<-enqueuer.Packets // DATA_ACK
@@ -892,6 +906,8 @@ func TestARQ_ReceiveDataLargeGapSamplesFrontierInsteadOfFloodingNacks(t *testing
 		DataNackMaxGap:        100,
 		DataNackRepeatSeconds: 0.1,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(140, []byte("packet 140"))
 	ack := <-enqueuer.Packets
@@ -923,6 +939,8 @@ func TestARQ_ReceiveDataClearsQueuedNackWhenMissingDataArrives(t *testing.T) {
 		DataNackMaxGap:        2,
 		DataNackRepeatSeconds: 2.0,
 	})
+	a.Start()
+	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.ReceiveData(1, []byte("packet 1"))
 	<-enqueuer.Packets

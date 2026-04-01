@@ -8,7 +8,6 @@
 package udpserver
 
 import (
-	"context"
 	"io"
 	"sync"
 	"time"
@@ -35,22 +34,12 @@ type Stream_server struct {
 	LastActivity time.Time
 	CloseTime    time.Time
 
-	UpstreamConn    io.ReadWriteCloser
-	TargetHost      string
-	TargetPort      uint16
-	Connected       bool
-	onClosed        func(uint16, time.Time, string)
-	log             arq.Logger
-	
-	rxChan          chan *serverInboundPacket
-	rxWorkerCancel  context.CancelFunc
-}
-
-type serverInboundPacket struct {
-	PacketType  uint8
-	SequenceNum uint16
-	FragmentID  uint8
-	Payload     []byte
+	UpstreamConn io.ReadWriteCloser
+	TargetHost   string
+	TargetPort   uint16
+	Connected    bool
+	onClosed     func(uint16, time.Time, string)
+	log          arq.Logger
 }
 
 func NewStreamServer(streamID uint16, sessionID uint8, arqConfig arq.Config, localConn io.ReadWriteCloser, mtu int, queueInitialCapacity int, logger arq.Logger) *Stream_server {
@@ -65,7 +54,6 @@ func NewStreamServer(streamID uint16, sessionID uint8, arqConfig arq.Config, loc
 		CreatedAt:    time.Now(),
 		LastActivity: time.Now(),
 		log:          logger,
-		rxChan:       make(chan *serverInboundPacket, 16384),
 	}
 
 	if s.log == nil {
@@ -74,65 +62,16 @@ func NewStreamServer(streamID uint16, sessionID uint8, arqConfig arq.Config, loc
 
 	s.ARQ = arq.NewARQ(streamID, sessionID, s, localConn, mtu, s.log, arqConfig)
 	s.ARQ.Start()
-	
-	ctx, cancel := context.WithCancel(context.Background())
-	s.rxWorkerCancel = cancel
-	go s.runInboundWorker(ctx)
-	
+
 	return s
 }
 
 func (s *Stream_server) enqueueInboundData(packetType uint8, sequenceNum uint16, fragmentID uint8, payload []byte) bool {
-	if s == nil || s.rxChan == nil {
+	if s == nil || s.ARQ == nil {
 		return false
 	}
 
-	pkt := &serverInboundPacket{
-		PacketType:  packetType,
-		SequenceNum: sequenceNum,
-		FragmentID:  fragmentID,
-		Payload:     payload,
-	}
-
-	select {
-	case s.rxChan <- pkt:
-		return true
-	default:
-		return false
-	}
-}
-
-func (s *Stream_server) shutdownInboundProcessing() {
-	if s == nil {
-		return
-	}
-	if s.rxWorkerCancel != nil {
-		s.rxWorkerCancel()
-		s.rxWorkerCancel = nil
-	}
-}
-
-func (s *Stream_server) runInboundWorker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case pkt, ok := <-s.rxChan:
-			if !ok {
-				return
-			}
-			
-			s.mu.RLock()
-			arqInst := s.ARQ
-			s.mu.RUnlock()
-			
-			if arqInst == nil || arqInst.IsClosed() || arqInst.IsReset() {
-				return // we can exit entirely or just continue? Just exit because ARQ is dead.
-			}
-
-			_ = arqInst.ReceiveData(pkt.SequenceNum, pkt.Payload)
-		}
-	}
+	return s.ARQ.ReceiveData(sequenceNum, payload)
 }
 
 // PushTXPacket implements arq.PacketEnqueuer.
@@ -352,7 +291,6 @@ func (s *Stream_server) cleanupResources() {
 	if upstream != nil {
 		_ = upstream.Close()
 	}
-	s.shutdownInboundProcessing()
 	s.ClearTXQueue()
 }
 

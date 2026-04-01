@@ -441,12 +441,12 @@ jobs:
               echo "$bin exited early with code $code"
               # We allow exit code 0 if it finished setup, or ignore if it's just a missing config error but didn't crash
               if [ "$code" -ne 0 ]; then
-                 echo "---- STDOUT ($bin) ----"
-                 cat "$out_file" || true
-                 echo "---- STDERR ($bin) ----"
-                 cat "$err_file" || true
-                 # For Go, we might expect some errors if config is missing, but it shouldn't "crash"
-                 # exit 1 
+                  echo "---- STDOUT ($bin) ----"
+                  cat "$out_file" || true
+                  echo "---- STDERR ($bin) ----"
+                  cat "$err_file" || true
+                  # For Go, we might expect some errors if config is missing, but it shouldn't "crash"
+                  # exit 1
               fi
             fi
           done
@@ -636,7 +636,6 @@ jobs:
           path: |
             dist/*.zip
             dist/*.tar.gz
-            dist/SHA256SUMS.txt
 
   release:
     name: Create Release and attach artifacts
@@ -655,9 +654,9 @@ jobs:
 
       - name: List downloaded artifacts
         run: |
-          echo "Contents of release_assets:" 
+          echo "Contents of release_assets:"
           ls -la release_assets || true
-          echo "Recursive listing:" 
+          echo "Recursive listing:"
           find release_assets -maxdepth 3 -print || true
 
       - name: Build release notes body
@@ -732,6 +731,13 @@ jobs:
           echo "Contents of release_assets:"
           find release_assets -maxdepth 5 -type f -print || true
 
+      - name: Build unified SHA256SUMS for release assets
+        run: |
+          set -euo pipefail
+          find release_assets -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > release_assets/SHA256SUMS.txt
+
       - name: Fail if no artifacts downloaded
         run: |
           set -euo pipefail
@@ -748,7 +754,7 @@ jobs:
           files: |
             release_assets/**/*.zip
             release_assets/**/*.tar.gz
-            release_assets/**/SHA256SUMS.txt
+            release_assets/SHA256SUMS.txt
           tag_name: ${{ needs.preflight.outputs.release_tag }}
           name: Release ${{ needs.preflight.outputs.release_tag }}
           body: ${{ fromJson(steps.create_release.outputs.result).body }}

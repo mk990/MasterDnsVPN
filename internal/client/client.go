@@ -103,6 +103,7 @@ type Client struct {
 	tunnelConn           *net.UDPConn
 	txChannel            chan asyncPacket
 	rxChannel            chan asyncReadPacket
+	encodeChannel        chan rawOutboundTask
 	tunnelReaderWorkers  int
 	tunnelWriterWorkers  int
 	tunnelProcessWorkers int
@@ -156,6 +157,17 @@ type clientStreamTXPacket struct {
 	RetryAt         time.Time
 	RetryCount      int
 	Scheduled       bool
+}
+
+// rawOutboundTask holds payload and stream information for parallel packet encoding.
+type rawOutboundTask struct {
+	packetType uint8
+	payload    []byte
+	opts       VpnProto.BuildOptions
+	wasPacked  bool
+	item       *clientStreamTXPacket
+	selected   *Stream_client
+	conns      []Connection
 }
 
 // Connection represents a unique domain-resolver pair with its associated metadata and MTU states.
@@ -247,6 +259,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		tunnelPacketTimeout:   time.Duration(cfg.TunnelPacketTimeoutSec * float64(time.Second)),
 		txChannel:             make(chan asyncPacket, cfg.TXChannelSize),
 		rxChannel:             make(chan asyncReadPacket, cfg.RXChannelSize),
+		encodeChannel:         make(chan rawOutboundTask, cfg.TXChannelSize),
 		active_streams:        make(map[uint16]*Stream_client),
 		recentlyClosedStreams: make(map[uint16]time.Time),
 		txSignal:              make(chan struct{}, 1),

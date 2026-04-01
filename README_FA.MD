@@ -1,4 +1,4 @@
-﻿# پروژه MasterDnsVPN 🔐
+# پروژه MasterDnsVPN 🔐
 
 ## | [نسخه فارسی](https://github.com/masterking32/MasterDnsVPN/blob/main/README_FA.MD) | [English Version](https://github.com/masterking32/MasterDnsVPN/blob/main/README.MD) | 
 
@@ -35,6 +35,9 @@
 | سیستم Duplication | ❌ | ❌ | بله — افزایش ترافیک برای تضمین پایداری (قابل تنظیم) |
 | MTU قابل پشتیبانی | بهتر از DNSTT | - | سازگار حتی با MTU کم به دلیل سربار بسیار پایین پروتکل |
 | سیستم Failover | ❌ | ❌ | ✅ |
+| سرعت دانلود 10 مگابایت در حالت لوکال | 🟡 0.978 ثانیه | 🔴 2.492 ثانیه | 🟢 0.278 ثانیه |
+| سرعت آپلود 10 مگابایت در حالت لوکال | 🟡 3.249 ثانیه | 🔴 16.207 ثانیه  | 🟢 2.205 ثانیه |
+| قابلیت فشرده سازی | ❌ | ❌ | 🟢<br> به سه روش مختلف قابل تنظیم<br>Off, ZSTD, LZ4, ZLIB |
 | بررسی سلامت رزولورها و غیرفعال‌سازی خودکار | ❌ | ❌ | ✅ |
 | بازفعال‌سازی رزولورها در صورت دسترسی دوباره (پس‌زمینه) | ❌ | ❌ | ✅ |
 | ارائه DNS محلی در کلاینت (جلوگیری از DNS Hijacking) | ❌ | ❌ | ✅ (با DNS Caching حرفه‌ای برای کاهش درخواست‌ها) |
@@ -544,6 +547,7 @@ sudo journalctl -u masterdnsvpn-client -f
 | `ARQ_CONTROL_PACKET_TTL_SECONDS` | `1200.0` | clamp به `30..86400` ثانیه | همان مفهوم برای packetهای control. |
 | `ARQ_MAX_DATA_RETRIES` | `1200` | clamp به `60..100000` | سقف retry packetهای data. |
 | `ARQ_DATA_NACK_MAX_GAP` | `64` | clamp به `0..32` در کد فعلی | تعیین می‌کند اگر جلوتر از `rcvNxt` packet رسید، تا چه فاصله‌ای gap را با NACK اعلام کنیم.<br>`0` یعنی NACK data عملاً خاموش است.<br>نکته مهم: sample مقدار `64` دارد، ولی کد فعلی آن را حداکثر تا `32` clamp می‌کند. |
+| `ARQ_DATA_NACK_INITIAL_DELAY_SECONDS` | `0.4` | clamp به `0..30` ثانیه | تأخیر اولیه قبل از ارسال NACK برای پکت‌های داده گم‌شده. سرعت درخواست ارسال مجدد را کنترل می‌کند. |
 | `ARQ_DATA_NACK_REPEAT_SECONDS` | `0.5` | clamp به `0.1..30` ثانیه | برای یک sequence گمشده، NACK تکراری با چه فاصله‌ای دوباره ارسال شود. |
 | `ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS` | `120.0` | clamp به `10..3600` ثانیه | وقتی stream وارد حالت terminal شد، چقدر صبر کنیم تا bufferهای باقیمانده drain شوند. |
 | `ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS` | `90.0` | clamp به `5..3600` ثانیه | بعد از closeهای terminal، چقدر برای ACK نهایی صبر کنیم. |
@@ -658,6 +662,7 @@ sudo journalctl -u masterdnsvpn-client -f
 | `ARQ_CONTROL_PACKET_TTL_SECONDS` | `1200.0` | clamp به `30..86400` ثانیه | TTL packetهای control. |
 | `ARQ_MAX_DATA_RETRIES` | `1200` | clamp به `60..100000` | سقف retry packetهای data. |
 | `ARQ_DATA_NACK_MAX_GAP` | در sample نیامده | clamp به `0..32` | اگر packetهای out-of-order برسند، تا چه فاصله‌ای gap با NACK گزارش شود.<br>این پارامتر در کد هست و در README قبلی جا افتاده بود؛ اگر لازم دارید می‌توانید به sample config هم اضافه‌اش کنید. |
+| `ARQ_DATA_NACK_INITIAL_DELAY_SECONDS` | `0.4` | clamp به `0..30` ثانیه | تأخیر اولیه قبل از ارسال NACK برای پکت‌های داده گم‌شده. سرعت درخواست ارسال مجدد را کنترل می‌کند. |
 | `ARQ_DATA_NACK_REPEAT_SECONDS` | در sample نیامده | clamp به `0.1..30` ثانیه | برای یک sequence گمشده، NACK تکراری با چه فاصله‌ای دوباره صادر شود.<br>این هم در کد فعال است و باید در مستندات باشد. |
 | `ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS` | `120.0` | clamp به `10..3600` ثانیه | بعد از terminal شدن stream، سرور چقدر برای drain شدن queueها صبر کند. |
 | `ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS` | `90.0` | clamp به `5..3600` ثانیه | بعد از close terminal، چقدر برای ACK نهایی صبر کند. |

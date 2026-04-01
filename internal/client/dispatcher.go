@@ -62,7 +62,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 			return true
 		}
 		for {
-			if c.txChannelHasCapacity(required) {
+			if c.encodeChannelHasCapacity(required) {
 				return true
 			}
 
@@ -222,7 +222,7 @@ dispatchLoop:
 			continue dispatchLoop
 		}
 
-		if !waitForTxCapacity(len(conns)) {
+		if !waitForTxCapacity(1) {
 			if ctx.Err() != nil {
 				return
 			}
@@ -393,48 +393,23 @@ dispatchLoop:
 			opts.TotalFragments = item.TotalFragments
 		}
 
-		encoded, err := c.buildEncodedAutoWithCompressionTrace(opts)
-		if err != nil {
+		task := rawOutboundTask{
+			packetType: finalPacket.packetType,
+			payload:    finalPacket.payload,
+			opts:       opts,
+			wasPacked:  wasPacked,
+			item:       item,
+			selected:   selected,
+			conns:      conns,
+		}
+
+		select {
+		case c.encodeChannel <- task:
+		case <-ctx.Done():
 			if !wasPacked && selected != nil {
 				selected.ReleaseTXPacket(item)
 			}
-			continue dispatchLoop
-		}
-
-		packetByDomain := make(map[string][]byte, len(conns))
-		// var isLogged bool = false
-		for _, conn := range conns {
-			domain := conn.Domain
-			if domain == "" {
-				domain = c.cfg.Domains[0]
-			}
-
-			dnsPacket, ok := packetByDomain[domain]
-			if !ok {
-				dnsPacket, err = buildTunnelTXTQuestion(domain, encoded)
-				if err != nil {
-					continue
-				}
-				packetByDomain[domain] = dnsPacket
-			}
-
-			pkt := finalPacket
-			pkt.conn = conn
-			pkt.payload = dnsPacket
-			pkt.sequenceNum = item.SequenceNum
-
-			select {
-			case c.txChannel <- pkt:
-			case <-ctx.Done():
-				if !wasPacked && selected != nil {
-					selected.ReleaseTXPacket(item)
-				}
-				return
-			}
-		}
-
-		if !wasPacked && selected != nil {
-			selected.ReleaseTXPacket(item)
+			return
 		}
 
 		select {

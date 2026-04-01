@@ -66,27 +66,17 @@ func newTestServerForDeferredCleanup() *Server {
 	}
 }
 
-func waitForInboundWorkerStop(t *testing.T, stream *Stream_server) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if stream.rxWorkerCancel == nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for inbound worker to stop")
-}
-
 func TestCleanupClosedSessionClosesStreamsAndClearsQueues(t *testing.T) {
 	s := newTestServerForCleanup()
 	record := newTestSessionRecord(7)
 	record.streamCleanup = s.cleanupStreamArtifacts
 
 	upstream := &testReadWriteCloser{}
-	stream := record.getOrCreateStream(1, arq.Config{}, nil, nil)
+	cfg := arq.Config{WindowSize: 32, RTO: 1.0, MaxRTO: 5.0}
+	stream := record.getOrCreateStream(1, cfg, nil, nil)
 	stream.UpstreamConn = upstream
 	stream.Connected = true
+
 	if !stream.enqueueInboundData(Enums.PACKET_STREAM_DATA, 1, 0, []byte("inbound")) {
 		t.Fatal("expected inbound packet to queue")
 	}
@@ -117,15 +107,14 @@ func TestCleanupClosedSessionClosesStreamsAndClearsQueues(t *testing.T) {
 	if !upstream.closed {
 		t.Fatalf("expected upstream connection to be closed")
 	}
+	if stream.Status != "CLOSED" {
+		t.Fatalf("expected stream status CLOSED, got %q", stream.Status)
+	}
 	if stream.TXQueue.Size() != 0 {
 		t.Fatalf("expected stream TX queue to be cleared, got %d", stream.TXQueue.Size())
 	}
-	if len(stream.rxChan) != 0 {
-		t.Fatalf("expected stream RX queue to be cleared, got %d", len(stream.rxChan))
-	}
-	waitForInboundWorkerStop(t, stream)
-	if stream.Status != "CLOSED" {
-		t.Fatalf("expected stream status CLOSED, got %q", stream.Status)
+	if stream.ARQ != nil && !stream.ARQ.IsClosed() {
+		t.Fatal("expected ARQ to be closed after cleanup")
 	}
 
 	record.StreamsMu.RLock()
@@ -162,23 +151,30 @@ func TestCleanupClosedSessionClosesStreamsAndClearsQueues(t *testing.T) {
 	}
 }
 
-func TestFinalizeAfterARQCloseStopsInboundWorkerAndClearsRXQueue(t *testing.T) {
+func TestFinalizeAfterARQCloseClearsTXQueue(t *testing.T) {
 	record := newTestSessionRecord(44)
-	stream := record.getOrCreateStream(5, arq.Config{}, nil, nil)
+	cfg := arq.Config{WindowSize: 32, RTO: 1.0, MaxRTO: 5.0}
+	stream := record.getOrCreateStream(5, cfg, nil, nil)
 	if stream == nil {
 		t.Fatal("expected stream to be created")
 	}
 
 	stream.Connected = true
-	if !stream.enqueueInboundData(Enums.PACKET_STREAM_DATA, 9, 0, []byte("inbound")) {
-		t.Fatal("expected inbound packet to queue")
+	if !stream.PushTXPacket(Enums.DefaultPacketPriority(Enums.PACKET_STREAM_RST), Enums.PACKET_STREAM_RST, 5, 0, 0, 0, 0, nil) {
+		t.Fatal("expected queued TX packet before finalize")
 	}
-
+	if stream.ARQ != nil {
+		stream.ARQ.Close("test close", arq.CloseOptions{Force: true})
+	}
 	stream.finalizeAfterARQClose("test close")
-
-	waitForInboundWorkerStop(t, stream)
+	if stream.Status != "CLOSED" {
+		t.Fatalf("expected stream status CLOSED, got %q", stream.Status)
+	}
 	if stream.TXQueue.Size() != 0 {
 		t.Fatalf("expected TX queue to be cleared, got %d", stream.TXQueue.Size())
+	}
+	if stream.ARQ != nil && !stream.ARQ.IsClosed() {
+		t.Fatal("expected ARQ to be closed")
 	}
 }
 

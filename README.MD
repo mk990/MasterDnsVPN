@@ -36,6 +36,8 @@ Like every DNS-based tunnel, MasterDnsVPN is sensitive to these conditions, so r
 | Duplication system | ❌ | ❌ | Yes — increases traffic to improve reliability (configurable) |
 | MTU tolerance | Better than DNSTT | - | Works even with very small MTU because protocol overhead is very low |
 | Failover system | ❌ | ❌ | ✅ |
+| Download speed 10MB (Local) | 🟡 0.978s | 🔴 2.492s | 🟢 0.278s |
+| Upload speed 10MB (Local) | 🟡 3.249s | 🔴 16.207s | 🟢 2.205s |
 | Resolver health checks and auto-disable | ❌ | ❌ | ✅ |
 | Background reactivation of healthy resolvers | ❌ | ❌ | ✅ |
 | Local DNS service on client (to reduce DNS hijacking) | ❌ | ❌ | ✅ (with strong DNS caching) |
@@ -558,6 +560,7 @@ These settings are critical on the server:
 | `ARQ_CONTROL_PACKET_TTL_SECONDS` | `900.0` | clamped in code | TTL for control packets. |
 | `ARQ_MAX_DATA_RETRIES` | `800` | clamped in code | Maximum retries for data packets. |
 | `ARQ_DATA_NACK_MAX_GAP` | `0` | clamped in code | Maximum gap size for NACK generation when packets arrive out of order. |
+| `ARQ_DATA_NACK_INITIAL_DELAY_SECONDS` | `0.4` | clamped in code | Initial delay before sending a NACK for missing data packets. Controls how eagerly the system requests retransmissions. |
 | `ARQ_DATA_NACK_REPEAT_SECONDS` | `2.0` | clamped in code | Minimum interval before repeating a NACK for the same missing sequence. |
 | `ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS` | `90.0` | clamped in code | After a stream becomes terminal, how long the client waits for queue drain. |
 | `ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS` | `60.0` | clamped in code | How long the client waits for the final terminal ACK. |
@@ -672,6 +675,7 @@ These settings are critical on the server:
 | `ARQ_CONTROL_PACKET_TTL_SECONDS` | `1200.0` | clamp to `30..86400` seconds | TTL for control packets. |
 | `ARQ_MAX_DATA_RETRIES` | `1200` | clamp to `60..100000` | Maximum retries for data packets. |
 | `ARQ_DATA_NACK_MAX_GAP` | not shown in sample | clamp to `0..32` | If out-of-order packets arrive, this controls how large a missing gap may be reported with NACK.<br>This exists in code and was missing in older README versions. |
+| `ARQ_DATA_NACK_INITIAL_DELAY_SECONDS` | `0.4` | clamped in code | Initial delay before sending a NACK for missing data packets. Controls how eagerly the system requests retransmissions. |
 | `ARQ_DATA_NACK_REPEAT_SECONDS` | not shown in sample | clamp to `0.1..30` seconds | For a missing sequence, this defines how soon a repeated NACK may be issued again.<br>This is active in code and should be documented. |
 | `ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS` | `120.0` | clamp to `10..3600` seconds | After a stream becomes terminal, how long the server waits for queues to drain. |
 | `ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS` | `90.0` | clamp to `5..3600` seconds | After terminal close, how long the server waits for the final ACK. |

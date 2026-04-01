@@ -441,12 +441,12 @@ jobs:
               echo "$bin exited early with code $code"
               # We allow exit code 0 if it finished setup, or ignore if it's just a missing config error but didn't crash
               if [ "$code" -ne 0 ]; then
-                 echo "---- STDOUT ($bin) ----"
-                 cat "$out_file" || true
-                 echo "---- STDERR ($bin) ----"
-                 cat "$err_file" || true
-                 # For Go, we might expect some errors if config is missing, but it shouldn't "crash"
-                 # exit 1 
+                  echo "---- STDOUT ($bin) ----"
+                  cat "$out_file" || true
+                  echo "---- STDERR ($bin) ----"
+                  cat "$err_file" || true
+                  # For Go, we might expect some errors if config is missing, but it shouldn't "crash"
+                  # exit 1
               fi
             fi
           done
@@ -636,4 +636,3 @@ jobs:
           path: |
             dist/*.zip
             dist/*.tar.gz
-            dist/SHA256SUMS.txt

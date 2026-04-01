@@ -910,8 +910,6 @@ func (r *sessionRecord) activeStreamSnapshot() ([]int32, []*Stream_server) {
 	return r.activeStreamSnapshotIDs, r.activeStreamSnapshotStreams
 }
 
-
-
 func (r *sessionRecord) closeAllStreams(reason string) {
 	if r == nil {
 		return
@@ -930,7 +928,10 @@ func (r *sessionRecord) closeAllStreams(reason string) {
 	for _, stream := range streams {
 		if reason != "session closed cleanup" {
 			stream.Abort(reason)
+		} else if stream.ARQ != nil {
+			stream.ARQ.Close(reason, arq.CloseOptions{Force: true})
 		}
+
 		stream.finalizeAfterARQClose(reason)
 	}
 

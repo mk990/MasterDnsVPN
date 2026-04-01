@@ -107,6 +107,10 @@ type rtxJob struct {
 	data            []byte
 	compressionType uint8
 }
+type rxPayload struct {
+	sn   uint16
+	data []byte
+}
 
 var setupControlPacketTypes = map[uint8]bool{
 	Enums.PACKET_STREAM_SYN: true,
@@ -210,6 +214,8 @@ type ARQ struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	flushSignal chan struct{}
+	rxChan      chan rxPayload
+	pendingInbound int
 }
 
 type closeWriter interface {
@@ -286,6 +292,7 @@ type Config struct {
 	TerminalAckWaitTimeout      float64
 	CompressionType             uint8
 	IsClient                    bool
+	InboundQueueSize            int
 }
 
 type CloseOptions struct {
@@ -365,6 +372,13 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 		compressionType:   cfg.CompressionType,
 		firstDataNackSeen: make(map[uint16]time.Time),
 		lastDataNackSent:  make(map[uint16]time.Time),
+
+		rxChan: make(chan rxPayload, func() int {
+			if cfg.InboundQueueSize > 0 {
+				return cfg.InboundQueueSize
+			}
+			return windowSize * 4
+		}()),
 	}
 
 	a.streamWorkersStarted = false
@@ -391,6 +405,9 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 func (a *ARQ) Start() {
 	a.wg.Add(1)
 	go a.retransmitLoop()
+
+	a.wg.Add(1)
+	go a.rxLoop()
 
 	if a.ioReady {
 		a.startStreamWorkers()
@@ -700,15 +717,12 @@ func (a *ARQ) MarkCloseReadReceived() {
 
 	if a.closeReadSent {
 		a.setState(StateClosing)
-		a.mu.Unlock()
-		a.halfCloseLocalWriter()
-		a.tryFinalizeRemoteEOF()
-		return
+	} else {
+		a.setState(StateHalfClosedRemote)
 	}
-
-	a.setState(StateHalfClosedRemote)
 	a.mu.Unlock()
-	a.halfCloseLocalWriter()
+
+	a.signalFlushReady()
 	a.tryFinalizeRemoteEOF()
 }
 
@@ -865,7 +879,7 @@ func (a *ARQ) clearTrackedControlPacket(packetType uint8, sequenceNum uint16, fr
 func (a *ARQ) tryFinalizeRemoteEOF() {
 	a.mu.Lock()
 	waitingForCloseReadAck := a.waitingAck && a.waitingAckFor == Enums.PACKET_STREAM_CLOSE_READ
-	receiveDrained := len(a.rcvBuf) == 0 || a.localWriterBroken
+	receiveDrained := (len(a.rcvBuf) == 0 && a.pendingInbound == 0) || a.localWriterBroken
 	writeSideSettled := (!a.localWriterBroken && (!a.closeWriteSent || a.closeWriteAcked)) ||
 		(a.localWriterBroken && (a.closeWriteSent || a.closeWriteAcked || a.closeWriteReceived))
 	shouldClose := !a.closed &&
@@ -1282,13 +1296,15 @@ func (a *ARQ) retransmitLoop() {
 
 // ReceiveData handles inbound STREAM_DATA and emit STREAM_DATA_ACK.
 func (a *ARQ) ReceiveData(sn uint16, data []byte) bool {
-	if a.isClosed() || a.IsReset() {
+	a.mu.RLock()
+	if a.closed || a.rstReceived || a.rstSent {
+		a.mu.RUnlock()
 		return false
 	}
 
-	now := time.Now()
-	a.mu.Lock()
-	if a.localWriterBroken || a.closeWriteSent || a.closeWriteAcked {
+	if a.localWriterBroken {
+		a.mu.RUnlock()
+		a.mu.Lock()
 		needCloseWrite := a.localWriterBroken &&
 			!a.closeWriteSent &&
 			!(a.waitingAck && a.waitingAckFor == Enums.PACKET_STREAM_CLOSE_WRITE) &&
@@ -1299,40 +1315,95 @@ func (a *ARQ) ReceiveData(sn uint16, data []byte) bool {
 		if needCloseWrite {
 			a.Close("Inbound data received after local writer closed", CloseOptions{SendCloseWrite: true})
 		}
-
 		return false
 	}
+
+	a.mu.RUnlock()
+
+	safeData := append([]byte(nil), data...)
+	a.mu.Lock()
+	a.pendingInbound++
+	a.mu.Unlock()
+
+	select {
+	case a.rxChan <- rxPayload{sn: sn, data: safeData}:
+		return true
+	default:
+		a.mu.Lock()
+		if a.pendingInbound > 0 {
+			a.pendingInbound--
+		}
+		a.mu.Unlock()
+		return false
+	}
+}
+
+func (a *ARQ) rxLoop() {
+	defer a.wg.Done()
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case payload := <-a.rxChan:
+			a.processReceivedData(payload.sn, payload.data)
+		}
+	}
+}
+
+func (a *ARQ) processReceivedData(sn uint16, data []byte) {
+	now := time.Now()
+
+	a.mu.Lock()
+	if a.pendingInbound > 0 {
+		a.pendingInbound--
+	}
+	if a.localWriterBroken || a.closeWriteSent || a.closeWriteAcked {
+		needCloseWrite := a.localWriterBroken &&
+			!a.closeWriteSent &&
+			!(a.waitingAck && a.waitingAckFor == Enums.PACKET_STREAM_CLOSE_WRITE) &&
+			!a.closed &&
+			!a.rstReceived &&
+			!a.rstSent
+
+		a.mu.Unlock()
+		if needCloseWrite {
+			a.Close("Inbound data received after local writer closed", CloseOptions{SendCloseWrite: true})
+		}
+		return
+	}
+
 	a.lastActivity = now
 	diff := sn - a.rcvNxt
 
-	if diff >= 32768 { // Packet is older than rcvNxt
+	if diff >= 32768 {
 		a.mu.Unlock()
 		a.enqueuer.PushTXPacket(
 			Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_ACK),
 			Enums.PACKET_STREAM_DATA_ACK,
 			sn, 0, 0, 0, 0, nil,
 		)
-		return true
+		return
 	}
 
 	if int(diff) > a.windowSize {
 		a.mu.Unlock()
-		return true
+		return
 	}
 
 	_, exists := a.rcvBuf[sn]
-
 	if !exists && len(a.rcvBuf) >= a.windowSize && sn != a.rcvNxt {
 		a.mu.Unlock()
-		return true
+		return
 	}
 
 	if !exists {
-		a.rcvBuf[sn] = append([]byte(nil), data...)
+		a.rcvBuf[sn] = data
 	}
 	a.mu.Unlock()
 
 	a.clearSentDataNack(sn)
+
 	a.enqueuer.PushTXPacket(
 		Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_ACK),
 		Enums.PACKET_STREAM_DATA_ACK,
@@ -1340,11 +1411,8 @@ func (a *ARQ) ReceiveData(sn uint16, data []byte) bool {
 	)
 
 	a.maybeSendDataNacks(sn)
-
 	a.signalFlushReady()
-	return true
 }
-
 func (a *ARQ) writeLoop() {
 	defer a.wg.Done()
 
@@ -1387,6 +1455,13 @@ func (a *ARQ) writeLoop() {
 			a.mu.Unlock()
 
 			if len(toWrite) == 0 {
+				a.mu.Lock()
+				cr := a.closeReadReceived
+				pendingInbound := a.pendingInbound
+				a.mu.Unlock()
+				if cr && pendingInbound == 0 {
+					a.halfCloseLocalWriter()
+				}
 				a.tryFinalizeRemoteEOF()
 				break
 			}
