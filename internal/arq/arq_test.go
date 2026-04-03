@@ -2028,7 +2028,7 @@ func TestARQ_ClientCloseWriteAckInitiatesCloseReadWhenWriterBroken(t *testing.T)
 		IsClient:                 true,
 	})
 
-	a.markLocalWriterBroken()
+	a.markLocalWriterBroken("test setup")
 	a.Close("Local App Closed Connection (writer closed)", CloseOptions{SendCloseWrite: true})
 
 	select {
@@ -2062,7 +2062,7 @@ func TestARQ_ClientCloseWriteAndCloseReadAckFinalizeWithoutPeerCloseRead(t *test
 		IsClient:                 true,
 	})
 
-	a.markLocalWriterBroken()
+	a.markLocalWriterBroken("test setup")
 	a.Close("Local App Closed Connection (writer closed)", CloseOptions{SendCloseWrite: true})
 
 	select {
@@ -2105,7 +2105,7 @@ func TestARQ_ClientLocalDisconnectWaitsForPendingInboundQueueToDrain(t *testing.
 		IsClient:                 true,
 	})
 
-	a.markLocalWriterBroken()
+	a.markLocalWriterBroken("test setup")
 	a.mu.Lock()
 	a.pendingInbound = 1
 	a.mu.Unlock()

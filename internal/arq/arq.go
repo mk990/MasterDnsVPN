@@ -825,7 +825,7 @@ func (a *ARQ) tryFinalizeClientLocalDisconnect() {
 	}
 }
 
-func (a *ARQ) markLocalWriterBroken() {
+func (a *ARQ) markLocalWriterBroken(reason string) {
 	a.mu.Lock()
 	a.localWriterBroken = true
 	a.localWritePending = false
@@ -1614,7 +1614,7 @@ func (a *ARQ) writeLoop() {
 						class := classifyIOError(err)
 						if class == ioErrorTimeout || class == ioErrorTransient {
 							if transientRetries >= ioTransientWriteBudget {
-								a.markLocalWriterBroken()
+								a.markLocalWriterBroken("local app write timeout/transient budget exceeded: " + err.Error())
 								if a.isGracefulCloseInProgress() {
 									a.Close("Local App Write Error during graceful close: "+err.Error(), CloseOptions{SendCloseWrite: true})
 									shouldExit = true
@@ -1630,7 +1630,7 @@ func (a *ARQ) writeLoop() {
 						}
 
 						if class == ioErrorEOF || class == ioErrorClosed {
-							a.markLocalWriterBroken()
+							a.markLocalWriterBroken("local app writer closed: " + err.Error())
 							if a.isGracefulCloseInProgress() {
 								a.Close("Local App Closed Connection (writer closed during graceful close)", CloseOptions{SendCloseWrite: true})
 								shouldExit = true
@@ -1642,12 +1642,12 @@ func (a *ARQ) writeLoop() {
 						}
 
 						if a.isGracefulCloseInProgress() {
-							a.markLocalWriterBroken()
+							a.markLocalWriterBroken("local app write error during graceful close: " + err.Error())
 							a.Close("Local App Write Error during graceful close: "+err.Error(), CloseOptions{SendCloseWrite: true})
 							shouldExit = true
 							return
 						}
-						a.markLocalWriterBroken()
+						a.markLocalWriterBroken("local app write error: " + err.Error())
 						a.Close("Local App Write Error: "+err.Error(), CloseOptions{SendCloseWrite: true})
 						shouldExit = true
 						return
