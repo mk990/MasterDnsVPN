@@ -4,13 +4,6 @@
 
 **MasterDnsVPN** is a scientific and research-oriented project for carrying TCP traffic through DNS queries and responses. In broad goal, it is similar to projects such as DNSTT or SlipStream, but it follows a fundamentally different structure and implementation approach.
 This system is designed around compatibility with many resolver behaviors and harsh network conditions, with the goal of preserving the highest possible stability and data delivery even in the worst cases.
-Although the overall design is strong, the final quality and speed of the tunnel depend heavily on:
-
-1. Resolver quality and behavior (resolve speed, supported MTU, stability, and more)
-2. Your external server (server latency, connectivity to resolvers, and hardware quality)
-3. Your own internet quality (access speed to resolvers and whether suitable resolvers are reachable)
-
-Like every DNS-based tunnel, MasterDnsVPN is sensitive to these conditions, so real-world performance can vary depending on the environment.
 
 ### 📊 MasterDnsVPN Compared with Similar Projects
 
@@ -21,7 +14,7 @@ Like every DNS-based tunnel, MasterDnsVPN is sensitive to these conditions, so r
 | Transport header overhead | 🟠 ~24B | 🔴 ~59B | 🟢 ~5–7B (≈88% lower than DNSTT, ≈71% lower than SlipStream) |
 | Encryption style | TLS 1.3 (inside QUIC) | Noise (Curve25519) | AES / ChaCha20 / XOR (if XOR is used: lightweight with lower security and no extra overhead) |
 | Architecture | Unified (QUIC handles everything) | Multi-layered (KCP + SMUX + Noise) | Lightweight custom design optimized for DNS |
-| Performance (speed) | 🟡 High (up to ~5× faster than DNSTT) | 🔴 Medium | 🟢 Works well in very poor conditions; often performs better in practice |
+| Performance (speed) | 🟡 High (up to ~5× faster than DNSTT) | 🔴 Medium | 🟢 Works well in very poor conditions; faster than others in the same situation |
 | Stability under packet loss | 🟡 Good | 🟠 Medium | 🟢 Very high (Multipath + ARQ) |
 | Multi-resolver support | Yes (multipath) | ❌ | Yes — advanced (multi-resolver + duplication) |
 | Resilience under heavy censorship | Good | Medium | Very strong (a core project goal) |
@@ -36,8 +29,8 @@ Like every DNS-based tunnel, MasterDnsVPN is sensitive to these conditions, so r
 | Duplication system | ❌ | ❌ | Yes — increases traffic to improve reliability (configurable) |
 | MTU tolerance | Better than DNSTT | - | Works even with very small MTU because protocol overhead is very low |
 | Failover system | ❌ | ❌ | ✅ |
-| Download speed 10MB (Local) | 🟡 0.978s | 🔴 2.492s | 🟢 0.278s |
-| Upload speed 10MB (Local) | 🟡 3.249s | 🔴 16.207s | 🟢 2.205s |
+| Download speed 10MB (Local) | 🟡 0.978s | 🔴 2.492s | 🟢 0.270s |
+| Upload speed 10MB (Local) | 🟡 3.249s | 🔴 16.207s | 🟢 1.746s |
 | Resolver health checks and auto-disable | ❌ | ❌ | ✅ |
 | Background reactivation of healthy resolvers | ❌ | ❌ | ✅ |
 | Local DNS service on client (to reduce DNS hijacking) | ❌ | ❌ | ✅ (with strong DNS caching) |
