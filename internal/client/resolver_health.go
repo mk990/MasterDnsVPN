@@ -355,18 +355,31 @@ func (c *Client) disableResolverConnection(serverKey string, cause string) bool 
 	if !ok || !conn.IsValid || c.balancer.ValidCount() <= 3 {
 		return false
 	}
+	now := c.now()
+	nextAt := now.Add(maxDuration(5*time.Second, c.recheckServerInterval()*2))
+
+	c.resolverHealthMu.Lock()
+	meta := c.resolverRecheck[serverKey]
+	c.runtimeDisabled[serverKey] = resolverDisabledState{
+		DisabledAt:  now,
+		NextRetryAt: nextAt,
+		RetryCount:  meta.FailCount,
+		Cause:       cause,
+	}
+	c.resolverHealthMu.Unlock()
+
 	if !c.balancer.SetConnectionValidity(serverKey, false) {
+		c.resolverHealthMu.Lock()
+		delete(c.runtimeDisabled, serverKey)
+		c.resolverHealthMu.Unlock()
 		return false
 	}
 	if refreshed, ok := c.GetConnectionByKey(serverKey); ok {
 		conn = refreshed
 	}
 
-	now := c.now()
-	nextAt := now.Add(maxDuration(5*time.Second, c.recheckServerInterval()*2))
-
 	c.resolverHealthMu.Lock()
-	meta := c.resolverRecheck[serverKey]
+	meta = c.resolverRecheck[serverKey]
 	meta.NextAt = nextAt
 	c.resolverRecheck[serverKey] = meta
 	c.runtimeDisabled[serverKey] = resolverDisabledState{
