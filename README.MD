@@ -505,8 +505,7 @@ These settings are critical on the server:
 
 | Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
 | :--- | :--- | :--- | :--- |
-| `TUNNEL_READER_WORKERS` | `6` | if invalid, fallback applies | Number of workers reading raw UDP tunnel traffic. |
-| `TUNNEL_WRITER_WORKERS` | `6` | if invalid, fallback applies | Number of workers writing UDP tunnel traffic. |
+| `RX_TX_WORKERS` | `6` | if invalid, fallback applies | Number of shared runtime workers used for both UDP tunnel reads and writes. |
 | `TUNNEL_PROCESS_WORKERS` | `4` | if invalid, fallback applies | Number of workers processing tunnel packets after read. |
 | `TUNNEL_PACKET_TIMEOUT_SECONDS` | `8.0` | if invalid, fallback applies | Overall timeout for tunnel packet handling. |
 | `DISPATCHER_IDLE_POLL_INTERVAL_SECONDS` | `0.020` | if invalid, fallback applies | When there is nothing to send, the dispatcher sleeps for this interval before polling again. |
@@ -756,7 +755,7 @@ If you set it too low:
 
 ## Section 4: Mobile Usage Guide (Android and iPhone) 📱
 
-Since there is currently no direct Android or iOS application, you can still use the tunnel on mobile with one of these methods:
+Since there is currently no official Android or iOS application published directly by us, you can still use the tunnel on mobile with one of these methods. You can also use Android clients built by other developers that are introduced in Section 5.1.
 
 ### Method 1: Share the proxy from your computer 📶
 
@@ -781,6 +780,27 @@ If you already have another panel or service on a server, you can point its outb
 - If `LISTEN_IP = "0.0.0.0"`, enable SOCKS5 authentication or make sure your network is trusted. Otherwise anyone on that network can use your tunnel. Using username/password on Internet-facing SOCKS5 is strongly recommended.
 - You can also change the default `LISTEN_PORT` so it is less exposed to automated scans.
 - If devices cannot connect, check the system firewall.
+
+---
+
+## Section 5: Side Notes and Extra Information 🖥️
+
+### Section 5.1: Community Projects Related to MasterDnsVPN 🧩
+
+In this section, we introduce a few projects related to MasterDnsVPN that have been developed by other people. They may be useful for practical use, inspiration, or experimentation. Please note that these projects are independent from MasterDnsVPN itself and may behave differently or include their own additional features and design choices.
+
+If you use these projects or benefit from their ideas, please consider supporting their developers by starring their GitHub repositories. If you encounter issues or have suggestions, it is best to open an issue or, if possible, contribute with a pull request to those projects directly.
+
+You can review these related projects here:
+
+- [MDV HN Edition Android Client](https://github.com/Hidden-Node/MasterDnsVPN-AndroidClient)
+  An Android application built around MasterDnsVPN that allows connecting to MasterDnsVPN servers from a phone. This project is developed independently by Hidden Node.
+
+- [MasterDnsVPN GG Android Client](https://github.com/RevocGG/MasterDnsVPN-AndroidGG)
+  Another Android client built around MasterDnsVPN. This project is developed independently by RevocGG.
+
+- [Persian Config Builder for MasterDnsVPN](https://github.com/datacoder-io/MasterDnsVPN-ConfigMaker) - [Web Config Builder](https://datacoder-io.github.io/MasterDnsVPN-ConfigMaker)
+  A tool that helps create MasterDnsVPN configuration files with Persian explanations and a guided interface. This project is developed independently by datacoder-io.
 
 ---
 

@@ -28,6 +28,18 @@ func BuildEmptyNoErrorResponseFromLite(request []byte, parsed LitePacket) ([]byt
 	return buildResponseWithRCodeLite(request, parsed, Enums.DNSR_CODE_NO_ERROR)
 }
 
+func BuildNoDataResponse(request []byte) ([]byte, error) {
+	parsed, err := ParseDNSRequestLite(request)
+	if err != nil {
+		return nil, err
+	}
+	return BuildNoDataResponseFromLite(request, parsed)
+}
+
+func BuildNoDataResponseFromLite(request []byte, parsed LitePacket) ([]byte, error) {
+	return buildNoDataResponseLite(request, parsed)
+}
+
 func BuildFormatErrorResponse(request []byte) ([]byte, error) {
 	return buildResponseWithRCode(request, Enums.DNSR_CODE_FORMAT_ERROR)
 }
@@ -70,7 +82,6 @@ func buildResponseWithRCode(request []byte, rcode uint8) ([]byte, error) {
 		questionCount = header.QDCount
 	}
 
-
 	optStart, optLen := findOPTRecordRange(request, header, questionEndOffset)
 
 	response := make([]byte, dnsHeaderSize+questionLen+optLen)
@@ -86,7 +97,6 @@ func buildResponseWithRCode(request []byte, rcode uint8) ([]byte, error) {
 	if optLen > 0 {
 		copy(response[dnsHeaderSize+questionLen:], request[optStart:optStart+optLen])
 	}
-
 
 	return response, nil
 }
@@ -122,13 +132,16 @@ func buildResponseWithRCodeLite(request []byte, parsed LitePacket, rcode uint8) 
 	return response, nil
 }
 
+func buildNoDataResponseLite(request []byte, parsed LitePacket) ([]byte, error) {
+	return buildResponseWithRCodeLite(request, parsed, Enums.DNSR_CODE_NO_ERROR)
+}
+
 func getARCount(optLen int) int {
 	if optLen > 0 {
 		return 1
 	}
 	return 0
 }
-
 
 func isLikelyDNSRequestHeader(header Header) bool {
 	if header.QR != 0 {
@@ -153,7 +166,29 @@ func isLikelyDNSRequestHeader(header Header) bool {
 }
 
 func buildResponseFlags(requestFlags uint16, rcode uint8) uint16 {
-	return (1 << 15) | (requestFlags & 0x7810) | uint16(rcode&0x0F)
+	const (
+		flagQR     uint16 = 1 << 15
+		flagAA     uint16 = 1 << 10
+		flagTC     uint16 = 1 << 9
+		flagRD     uint16 = 1 << 8
+		flagRA     uint16 = 1 << 7
+		flagCD     uint16 = 1 << 4
+		opcodeMask uint16 = 0x7800
+	)
+
+	flags := flagQR | flagRA | (requestFlags & opcodeMask) | uint16(rcode&0x0F)
+	if requestFlags&flagRD != 0 {
+		flags |= flagRD
+	}
+	if requestFlags&flagCD != 0 {
+		flags |= flagCD
+	}
+
+	// Resolver-generated local answers should look recursive, not authoritative.
+	// AA/TC are intentionally cleared unless we are relaying an upstream answer
+	// verbatim, in which case those bits come from the upstream packet itself.
+	flags &^= flagAA | flagTC
+	return flags
 }
 
 func extractQuestionSection(request []byte, header Header) ([]byte, uint16, int) {
@@ -243,7 +278,6 @@ func findFirstOPTRecordInAdditional(data []byte, offset int, count int) (int, in
 
 	return 0, 0
 }
-
 
 func skipQuestions(data []byte, offset int, count int) (int, error) {
 	for range count {
@@ -345,4 +379,3 @@ func skipName(data []byte, offset int) (int, error) {
 		offset += length + 1
 	}
 }
-
