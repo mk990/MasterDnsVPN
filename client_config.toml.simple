@@ -116,12 +116,12 @@ LOCAL_DNS_CACHE_FLUSH_INTERVAL_SECONDS = 60.0
 RESOLVER_BALANCING_STRATEGY = 2
 
 # Duplicate each normal outgoing tunnel packet this many times.
-# Clamped in code to [1, 8].
+# Clamped in code to [1, 4].
 # Higher values improve resilience but increase bandwidth and CPU usage.
 PACKET_DUPLICATION_COUNT = 2
 
 # Duplicate stream setup packets (STREAM_SYN / SOCKS5_SYN) this many times.
-# Clamped in code to [PACKET_DUPLICATION_COUNT, 8].
+# Clamped in code to [PACKET_DUPLICATION_COUNT, 5].
 SETUP_PACKET_DUPLICATION_COUNT = 2
 
 # Stream-aware resolver failover.
@@ -159,11 +159,11 @@ AUTO_DISABLE_TIMEOUT_WINDOW_SECONDS = 30.0
 
 # Minimum observations required before auto-disable can trigger.
 # Clamped to [1, 10000].
-AUTO_DISABLE_MIN_OBSERVATIONS = 5
+AUTO_DISABLE_MIN_OBSERVATIONS = 50
 
 # Frequency of auto-disable evaluation.
 # Clamped to [0.25s, 600s].
-AUTO_DISABLE_CHECK_INTERVAL_SECONDS = 2.0
+AUTO_DISABLE_CHECK_INTERVAL_SECONDS = 4.0
 
 # If true, payload labels are base-encoded before tunneling.
 # Usually keep false unless a specific resolver path behaves better with it.
@@ -184,7 +184,7 @@ UPLOAD_COMPRESSION_TYPE = 0
 DOWNLOAD_COMPRESSION_TYPE = 0
 
 # Minimum payload size before compression is attempted.
-# Must be >= 1.
+# Must be >= 100.
 COMPRESSION_MIN_SIZE = 120
 
 # ------------------------------------------------------------------------------
@@ -283,6 +283,11 @@ SESSION_INIT_RETRY_MAX_SECONDS = 60.0
 # Clamped to [1s, 3600s].
 SESSION_INIT_BUSY_RETRY_INTERVAL_SECONDS = 60.0
 
+# Concurrent racing session initialization attempts.
+# Higher values improve reliability on unstable networks but increase DNS traffic.
+# Clamped to [1, 5].
+SESSION_INIT_RACING_COUNT = 3
+
 # Ping/keepalive pacing.
 # These control how aggressively the client sends ping traffic depending on
 # recent activity.
@@ -321,7 +326,7 @@ ARQ_MAX_DATA_RETRIES = 120
 # Maximum out-of-order gap ahead of rcvNxt that can trigger STREAM_DATA_NACK.
 # 0 disables NACK generation entirely.
 # Keep this small so only near-miss gaps cause early resend requests.
-ARQ_DATA_NACK_MAX_GAP = 64
+ARQ_DATA_NACK_MAX_GAP = 16
 
 # Minimum seconds between repeated NACKs for the same missing sequence number.
 # Clamped to [0.1s, 30s].

@@ -71,30 +71,42 @@ type mtuScanCounters struct {
 	rejectDownload atomic.Int32
 }
 
+type mtuDecision struct {
+	active        bool
+	reason        mtuRejectReason
+	rejectValue   int
+	uploadBytes   int
+	uploadChars   int
+	downloadBytes int
+	resolveTime   time.Duration
+}
+
 func (c *Client) RunInitialMTUTests(ctx context.Context) error {
-	if len(c.connections) == 0 {
+	if c.balancer == nil {
+		return ErrNoValidConnections
+	}
+
+	scanConnections := c.balancer.AllConnections()
+	if len(scanConnections) == 0 {
 		return ErrNoValidConnections
 	}
 
 	uploadCaps := c.precomputeUploadCaps()
-	workerCount := min(max(1, c.cfg.MTUTestParallelism), len(c.connections))
+	workerCount := min(max(1, c.cfg.MTUTestParallelism), len(scanConnections))
 	c.logMTUStart(workerCount)
 	c.prepareMTUSuccessOutputFile()
-	for idx := range c.connections {
-		c.prepareConnectionMTUScanState(&c.connections[idx])
-	}
 
 	counters := &mtuScanCounters{}
 	if workerCount <= 1 {
-		for idx := range c.connections {
+		for idx := range scanConnections {
 			if err := ctx.Err(); err != nil {
 				return nil
 			}
-			conn := &c.connections[idx]
-			c.runConnectionMTUTest(ctx, conn, idx+1, len(c.connections), uploadCaps[conn.Domain], counters)
+			conn := scanConnections[idx]
+			c.runConnectionMTUTest(ctx, conn, idx+1, len(scanConnections), uploadCaps[conn.Domain], counters)
 		}
 	} else {
-		jobs := make(chan int, len(c.connections))
+		jobs := make(chan int, len(scanConnections))
 		var wg sync.WaitGroup
 		for i := 0; i < workerCount; i++ {
 			wg.Add(1)
@@ -104,12 +116,12 @@ func (c *Client) RunInitialMTUTests(ctx context.Context) error {
 					if err := ctx.Err(); err != nil {
 						return
 					}
-					conn := &c.connections[idx]
-					c.runConnectionMTUTest(ctx, conn, idx+1, len(c.connections), uploadCaps[conn.Domain], counters)
+					conn := scanConnections[idx]
+					c.runConnectionMTUTest(ctx, conn, idx+1, len(scanConnections), uploadCaps[conn.Domain], counters)
 				}
 			}()
 		}
-		for idx := range c.connections {
+		for idx := range scanConnections {
 			select {
 			case <-ctx.Done():
 				close(jobs)
@@ -122,8 +134,8 @@ func (c *Client) RunInitialMTUTests(ctx context.Context) error {
 		wg.Wait()
 	}
 
-	c.balancer.RefreshValidConnections()
-	validConns, minUpload, minDownload, minUploadChars := summarizeValidMTUConnections(c.connections)
+	activeConns := c.balancer.ActiveConnections()
+	validConns, minUpload, minDownload, minUploadChars := summarizeValidMTUConnections(activeConns)
 	if len(validConns) == 0 {
 		if c.log != nil {
 			c.log.Errorf("<red>No valid connections found after MTU testing!</red>")
@@ -132,30 +144,190 @@ func (c *Client) RunInitialMTUTests(ctx context.Context) error {
 	}
 
 	c.applySyncedMTUState(minUpload, minDownload, minUploadChars)
-	c.initResolverRecheckMeta()
 	c.appendMTUUsageSeparatorOnce()
 	c.logMTUCompletion(validConns)
 	return nil
 }
 
-func (c *Client) prepareConnectionMTUScanState(conn *Connection) {
-	if conn == nil {
+func (c *Client) runResolverHealthLoop(ctx context.Context) {
+	if c == nil || c.balancer == nil {
 		return
 	}
-	conn.IsValid = true
-	conn.UploadMTUBytes = 0
-	conn.UploadMTUChars = 0
-	conn.DownloadMTUBytes = 0
-	conn.MTUResolveTime = 0
+
+	recheckInterval := c.resolverHealthRecheckInterval()
+	pollInterval := c.resolverHealthPollInterval(recheckInterval)
+	parallelism := c.resolverHealthParallelism()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		c.balancer.CollectExpiredResolverTimeouts(
+			c.now(),
+			c.tunnelPacketTimeout,
+		)
+
+		if c.cfg.RecheckInactiveServersEnabled {
+			c.runResolverHealthBatch(ctx, recheckInterval, parallelism)
+		}
+
+		timer := time.NewTimer(pollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
-func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, serverID int, total int, maxUploadPayload int, counters *mtuScanCounters) {
-	if conn == nil {
+func (c *Client) resolverHealthRecheckInterval() time.Duration {
+	interval := time.Duration(c.cfg.RecheckInactiveIntervalSeconds * float64(time.Second))
+	if interval <= 0 {
+		return 60 * time.Second
+	}
+	return interval
+}
+
+func (c *Client) resolverHealthPollInterval(recheckInterval time.Duration) time.Duration {
+	pollInterval := recheckInterval / 4
+	if pollInterval < time.Second {
+		return time.Second
+	}
+	if pollInterval > 5*time.Second {
+		return 5 * time.Second
+	}
+	return pollInterval
+}
+
+func (c *Client) resolverHealthParallelism() int {
+	if c.cfg.RecheckBatchSize < 1 {
+		return 1
+	}
+	return c.cfg.RecheckBatchSize
+}
+
+func (c *Client) runResolverHealthBatch(ctx context.Context, recheckInterval time.Duration, parallelism int) {
+	connections := c.collectInactiveResolverHealthChecks(recheckInterval, parallelism)
+	if len(connections) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, conn := range connections {
+		wg.Add(1)
+		go func(conn Connection) {
+			defer wg.Done()
+			c.recheckInactiveResolver(ctx, conn)
+		}(conn)
+	}
+	wg.Wait()
+}
+
+func (c *Client) collectInactiveResolverHealthChecks(recheckInterval time.Duration, parallelism int) []Connection {
+	connections := make([]Connection, 0, parallelism)
+	now := c.now()
+	for len(connections) < parallelism {
+		conn, ok := c.balancer.NextInactiveConnectionForHealthCheck(now, recheckInterval)
+		if !ok || conn.Key == "" || conn.IsValid {
+			break
+		}
+		connections = append(connections, conn)
+	}
+	return connections
+}
+
+func (c *Client) recheckInactiveResolver(ctx context.Context, conn Connection) {
+	transport, err := newUDPQueryTransport(conn.ResolverLabel)
+	if err != nil {
+		return
+	}
+	defer transport.conn.Close()
+
+	if !c.recheckResolverUploadMTU(ctx, conn, transport) {
+		return
+	}
+	if !c.recheckResolverDownloadMTU(ctx, conn, transport) {
+		return
+	}
+
+	c.reactivateRecheckedResolver(conn)
+}
+
+func (c *Client) recheckResolverUploadMTU(ctx context.Context, conn Connection, transport *udpQueryTransport) bool {
+	for attempt := 0; attempt < c.mtuTestRetries; attempt++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		passed, _, err := c.sendUploadMTUProbe(ctx, conn, transport, c.syncedUploadMTU, mtuProbeOptions{
+			Quiet:   true,
+			IsRetry: attempt > 0,
+		})
+		if err == nil && passed {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) recheckResolverDownloadMTU(ctx context.Context, conn Connection, transport *udpQueryTransport) bool {
+	for attempt := 0; attempt < c.mtuTestRetries; attempt++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		passed, _, err := c.sendDownloadMTUProbe(ctx, conn, transport, c.syncedDownloadMTU, c.syncedUploadMTU, mtuProbeOptions{
+			Quiet:   true,
+			IsRetry: attempt > 0,
+		})
+		if err == nil && passed {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) reactivateRecheckedResolver(conn Connection) {
+	conn.UploadMTUBytes = c.syncedUploadMTU
+	conn.UploadMTUChars = c.encodedCharsForPayload(c.syncedUploadMTU)
+	conn.DownloadMTUBytes = c.syncedDownloadMTU
+	c.reactivateResolverConnection(conn)
+}
+
+func (c *Client) reactivateResolverConnection(conn Connection) bool {
+	if c == nil || c.balancer == nil || conn.Key == "" {
+		return false
+	}
+
+	if !c.balancer.SetConnectionMTU(
+		conn.Key,
+		conn.UploadMTUBytes,
+		conn.UploadMTUChars,
+		conn.DownloadMTUBytes,
+	) {
+		return false
+	}
+
+	if !c.balancer.SetConnectionValidity(conn.Key, true) {
+		return false
+	}
+	c.balancer.SeedConservativeStats(conn.Key)
+
+	conn.IsValid = true
+
+	c.appendMTUAddedServerLine(&conn)
+	return true
+}
+
+func (c *Client) runConnectionMTUTest(ctx context.Context, conn Connection, serverID int, total int, maxUploadPayload int, counters *mtuScanCounters) {
+	if conn.Key == "" {
 		return
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			conn.IsValid = false
+			c.applyMTUDecision(conn.Key, mtuDecision{})
 			if c.log != nil {
 				c.log.Errorf(
 					"💥 <red>MTU Probe Worker Panic: <cyan>%v</cyan> (Resolver: <cyan>%s</cyan>)</red>",
@@ -195,6 +367,8 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 	if counters == nil {
 		return
 	}
+	decision := buildMTUDecision(result, reason)
+	c.applyMTUDecision(conn.Key, decision)
 
 	switch reason {
 	case mtuRejectUpload:
@@ -207,7 +381,7 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 				total,
 				conn.Domain,
 				conn.ResolverLabel,
-				result.UploadBytes,
+				decision.rejectValue,
 				counters.valid.Load(),
 				rejectedNow,
 			)
@@ -223,19 +397,13 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 				total,
 				conn.Domain,
 				conn.ResolverLabel,
-				result.DownloadBytes,
+				decision.rejectValue,
 				counters.valid.Load(),
 				rejectedNow,
 			)
 		}
 		return
 	}
-
-	conn.IsValid = true
-	conn.UploadMTUBytes = result.UploadBytes
-	conn.UploadMTUChars = result.UploadChars
-	conn.DownloadMTUBytes = result.DownloadBytes
-	conn.MTUResolveTime = result.ResolveTime
 
 	completed := counters.completed.Add(1)
 	validNow := counters.valid.Add(1)
@@ -247,28 +415,28 @@ func (c *Client) runConnectionMTUTest(ctx context.Context, conn *Connection, ser
 			total,
 			conn.Domain,
 			conn.ResolverLabel,
-			conn.UploadMTUBytes,
-			conn.DownloadMTUBytes,
+			decision.uploadBytes,
+			decision.downloadBytes,
 			validNow,
 			rejectedNow,
 		)
 	}
-	c.appendMTUSuccessLine(conn)
+	if acceptedConn, ok := c.balancer.GetConnectionByKey(conn.Key); ok {
+		c.appendMTUSuccessLine(&acceptedConn)
+	}
 }
 
-func (c *Client) probeConnectionMTU(ctx context.Context, conn *Connection, maxUploadPayload int) (mtuConnectionProbeResult, mtuRejectReason) {
+func (c *Client) probeConnectionMTU(ctx context.Context, conn Connection, maxUploadPayload int) (mtuConnectionProbeResult, mtuRejectReason) {
 	var result mtuConnectionProbeResult
 
 	probeTransport, err := newUDPQueryTransport(conn.ResolverLabel)
 	if err != nil {
-		conn.IsValid = false
 		return result, mtuRejectUpload
 	}
 	defer probeTransport.conn.Close()
 
 	upOK, upBytes, upChars, upRTT, err := c.testUploadMTU(ctx, conn, probeTransport, maxUploadPayload)
 	if err != nil || !upOK {
-		conn.IsValid = false
 		result.UploadBytes = upBytes
 		result.UploadChars = upChars
 		return result, mtuRejectUpload
@@ -278,13 +446,50 @@ func (c *Client) probeConnectionMTU(ctx context.Context, conn *Connection, maxUp
 
 	downOK, downBytes, downRTT, err := c.testDownloadMTU(ctx, conn, probeTransport, upBytes)
 	if err != nil || !downOK {
-		conn.IsValid = false
 		result.DownloadBytes = downBytes
 		return result, mtuRejectDownload
 	}
 	result.DownloadBytes = downBytes
 	result.ResolveTime = averageMTUProbeRTT(upRTT, downRTT)
 	return result, mtuRejectNone
+}
+
+func buildMTUDecision(result mtuConnectionProbeResult, reason mtuRejectReason) mtuDecision {
+	decision := mtuDecision{
+		active:        reason == mtuRejectNone,
+		reason:        reason,
+		uploadBytes:   result.UploadBytes,
+		uploadChars:   result.UploadChars,
+		downloadBytes: result.DownloadBytes,
+		resolveTime:   result.ResolveTime,
+	}
+	switch reason {
+	case mtuRejectUpload:
+		decision.uploadBytes = 0
+		decision.uploadChars = 0
+		decision.downloadBytes = 0
+		decision.resolveTime = 0
+		decision.rejectValue = result.UploadBytes
+	case mtuRejectDownload:
+		decision.downloadBytes = 0
+		decision.resolveTime = 0
+		decision.rejectValue = result.DownloadBytes
+	}
+	return decision
+}
+
+func (c *Client) applyMTUDecision(key string, decision mtuDecision) {
+	if c == nil || c.balancer == nil || key == "" {
+		return
+	}
+	_ = c.balancer.ApplyMTUProbeResult(
+		key,
+		decision.uploadBytes,
+		decision.uploadChars,
+		decision.downloadBytes,
+		decision.resolveTime,
+		decision.active,
+	)
 }
 
 func (c *Client) precomputeUploadCaps() map[string]int {
@@ -298,7 +503,7 @@ func (c *Client) precomputeUploadCaps() map[string]int {
 	return caps
 }
 
-func (c *Client) testUploadMTU(ctx context.Context, conn *Connection, probeTransport *udpQueryTransport, maxPayload int) (bool, int, int, time.Duration, error) {
+func (c *Client) testUploadMTU(ctx context.Context, conn Connection, probeTransport *udpQueryTransport, maxPayload int) (bool, int, int, time.Duration, error) {
 	if maxPayload <= 0 {
 		return false, 0, 0, 0, nil
 	}
@@ -331,7 +536,7 @@ func (c *Client) testUploadMTU(ctx context.Context, conn *Connection, probeTrans
 	return true, best, c.encodedCharsForPayload(best), bestRTT, nil
 }
 
-func (c *Client) testDownloadMTU(ctx context.Context, conn *Connection, probeTransport *udpQueryTransport, uploadMTU int) (bool, int, time.Duration, error) {
+func (c *Client) testDownloadMTU(ctx context.Context, conn Connection, probeTransport *udpQueryTransport, uploadMTU int) (bool, int, time.Duration, error) {
 	if c.log != nil && c.log.Enabled(logger.LevelDebug) {
 		c.log.Debugf("<cyan>[MTU]</cyan> Testing download MTU for %s", conn.Domain)
 	}
@@ -450,7 +655,7 @@ func (c *Client) binarySearchMTU(ctx context.Context, label string, minValue, ma
 	return best, bestRTT
 }
 
-func (c *Client) sendUploadMTUProbe(ctx context.Context, conn *Connection, probeTransport *udpQueryTransport, mtuSize int, options mtuProbeOptions) (bool, time.Duration, error) {
+func (c *Client) sendUploadMTUProbe(ctx context.Context, conn Connection, probeTransport *udpQueryTransport, mtuSize int, options mtuProbeOptions) (bool, time.Duration, error) {
 	if mtuSize < 1+mtuProbeCodeLength {
 		return false, 0, nil
 	}
@@ -558,7 +763,7 @@ func (c *Client) sendUploadMTUProbe(ctx context.Context, conn *Connection, probe
 	return ok, rtt, nil
 }
 
-func (c *Client) sendDownloadMTUProbe(ctx context.Context, conn *Connection, probeTransport *udpQueryTransport, mtuSize int, uploadMTU int, options mtuProbeOptions) (bool, time.Duration, error) {
+func (c *Client) sendDownloadMTUProbe(ctx context.Context, conn Connection, probeTransport *udpQueryTransport, mtuSize int, uploadMTU int, options mtuProbeOptions) (bool, time.Duration, error) {
 	if mtuSize < defaultMTUMinFloor {
 		return false, 0, nil
 	}
@@ -790,17 +995,21 @@ func summarizeValidMTUConnections(connections []Connection) (validConns []Connec
 		}
 		validConns = append(validConns, conn)
 
-		if conn.UploadMTUBytes > 0 && (minUpload == 0 || conn.UploadMTUBytes < minUpload) {
-			minUpload = conn.UploadMTUBytes
-		}
-		if conn.DownloadMTUBytes > 0 && (minDownload == 0 || conn.DownloadMTUBytes < minDownload) {
-			minDownload = conn.DownloadMTUBytes
-		}
-		if conn.UploadMTUChars > 0 && (minUploadChars == 0 || conn.UploadMTUChars < minUploadChars) {
-			minUploadChars = conn.UploadMTUChars
-		}
+		minUpload = minPositive(minUpload, conn.UploadMTUBytes)
+		minDownload = minPositive(minDownload, conn.DownloadMTUBytes)
+		minUploadChars = minPositive(minUploadChars, conn.UploadMTUChars)
 	}
 	return validConns, minUpload, minDownload, minUploadChars
+}
+
+func minPositive(current, candidate int) int {
+	if candidate <= 0 {
+		return current
+	}
+	if current == 0 || candidate < current {
+		return candidate
+	}
+	return current
 }
 
 func (c *Client) encodedCharsForPacketPayload(packetType uint8, payloadLen int) int {

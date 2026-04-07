@@ -509,7 +509,6 @@ These settings are critical on the server:
 | `TUNNEL_PROCESS_WORKERS` | `4` | if invalid, fallback applies | Number of workers processing tunnel packets after read. |
 | `TUNNEL_PACKET_TIMEOUT_SECONDS` | `8.0` | if invalid, fallback applies | Overall timeout for tunnel packet handling. |
 | `DISPATCHER_IDLE_POLL_INTERVAL_SECONDS` | `0.020` | if invalid, fallback applies | When there is nothing to send, the dispatcher sleeps for this interval before polling again. |
-| `TX_CHANNEL_SIZE` | `4096` | if invalid, fallback applies | Capacity of the outgoing tunnel packet channel. |
 | `RX_CHANNEL_SIZE` | `4096` | if invalid, fallback applies | Capacity of the incoming tunnel packet channel. |
 | `RESOLVER_UDP_CONNECTION_POOL_SIZE` | `64` | if invalid, fallback applies | Number of reusable UDP sockets kept per resolver label. |
 | `STREAM_QUEUE_INITIAL_CAPACITY` | `128` | if invalid, fallback applies | Initial queue capacity for per-stream client transmit queues. |

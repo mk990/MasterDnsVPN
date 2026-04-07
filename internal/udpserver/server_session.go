@@ -351,9 +351,7 @@ func (s *Server) dequeueSessionResponse(sessionID uint8, now time.Time) (*VpnPro
 		var selectedStreamID uint16
 
 		if id == -1 {
-			p, _, popOk := record.OrphanQueue.Pop(func(p VpnProto.Packet) uint64 {
-				return Enums.PacketTypeStreamKey(p.StreamID, p.PacketType)
-			})
+			p, _, popOk := record.OrphanQueue.Pop()
 			if popOk {
 				item = &serverStreamTXPacket{
 					PacketType:     p.PacketType,

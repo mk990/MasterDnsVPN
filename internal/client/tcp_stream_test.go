@@ -174,9 +174,7 @@ func TestRecentlyClosedCloseReadStreamSuppressesLateOrphanReset(t *testing.T) {
 	if !handled {
 		t.Fatal("expected late CLOSE_READ for recently closed stream to be consumed")
 	}
-	packet, _, ok := c.orphanQueue.Pop(func(packet VpnProto.Packet) uint64 {
-		return orphanResetKey(packet.PacketType, packet.StreamID)
-	})
+	packet, _, ok := c.orphanQueue.Pop()
 	if !ok {
 		t.Fatal("expected CLOSE_READ_ACK to be queued for recently closed stream")
 	}
@@ -207,9 +205,7 @@ func TestRecentlyClosedResetStreamSuppressesLateOrphanReset(t *testing.T) {
 	if !handled {
 		t.Fatal("expected late CLOSE_READ for reset-closed stream to be consumed")
 	}
-	packet, _, ok := c.orphanQueue.Pop(func(packet VpnProto.Packet) uint64 {
-		return orphanResetKey(packet.PacketType, packet.StreamID)
-	})
+	packet, _, ok := c.orphanQueue.Pop()
 	if !ok {
 		t.Fatal("expected CLOSE_READ_ACK to be queued for reset-closed stream")
 	}
@@ -233,9 +229,7 @@ func TestRecentlyClosedStreamStillAcksLateSocksConnected(t *testing.T) {
 		t.Fatal("expected late SOCKS5_CONNECTED for recently closed stream to be consumed")
 	}
 
-	packet, _, ok := c.orphanQueue.Pop(func(packet VpnProto.Packet) uint64 {
-		return orphanResetKey(packet.PacketType, packet.StreamID)
-	})
+	packet, _, ok := c.orphanQueue.Pop()
 	if !ok {
 		t.Fatal("expected SOCKS5_CONNECTED_ACK to be queued for recently closed stream")
 	}
@@ -282,9 +276,7 @@ func TestTerminalStreamDataQueuesRST(t *testing.T) {
 		t.Fatalf("expected queued response for terminal stream data, got queue size %d", size)
 	}
 
-	queued, _, ok := c.orphanQueue.Pop(func(packet VpnProto.Packet) uint64 {
-		return orphanResetKey(packet.PacketType, packet.StreamID)
-	})
+	queued, _, ok := c.orphanQueue.Pop()
 	if !ok {
 		t.Fatal("expected STREAM_RST for terminal stream data")
 	}
@@ -310,9 +302,7 @@ func TestRecentlyClosedStreamDataQueuesRST(t *testing.T) {
 		t.Fatal("expected late DATA for recently closed stream to be consumed")
 	}
 
-	packet, _, ok := c.orphanQueue.Pop(func(packet VpnProto.Packet) uint64 {
-		return orphanResetKey(packet.PacketType, packet.StreamID)
-	})
+	packet, _, ok := c.orphanQueue.Pop()
 	if !ok {
 		t.Fatal("expected STREAM_RST queued for late data on recently closed stream")
 	}
