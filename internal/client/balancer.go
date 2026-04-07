@@ -333,6 +333,9 @@ func (b *Balancer) ReportTimeoutWindow(serverKey string, now time.Time, window t
 	if minActive < 0 {
 		minActive = 0
 	}
+	if minActive < 3 {
+		minActive = 3
+	}
 
 	if int(conn.WindowSent) < minObservations {
 		return false
